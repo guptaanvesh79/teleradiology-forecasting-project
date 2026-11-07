@@ -1,13 +1,14 @@
 """Read-only service for validated, precomputed October artifacts."""
 
-from contextlib import asynccontextmanager
-from datetime import date as Date, datetime
 import json
+from contextlib import asynccontextmanager
+from datetime import date as Date
+from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
 import pandas as pd
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
 from .artifacts import validate_daily, validate_hourly
@@ -78,16 +79,21 @@ def load_artifacts(root):
     except (OSError, ValueError, KeyError) as error:
         raise RuntimeError(
             "Forecast artifacts are missing or invalid. Generate and validate them with "
-            "'python -m forecasting forecast' before starting the service. " + str(error)
+            "'python -m forecasting forecast' before starting the service. "
+            + str(error)
         ) from error
 
 
 def date_range(start_date, end_date):
     start, end = start_date or FIRST_DAY, end_date or LAST_DAY
     if start > end:
-        raise HTTPException(status_code=422, detail="start_date must be on or before end_date")
+        raise HTTPException(
+            status_code=422, detail="start_date must be on or before end_date"
+        )
     if start < FIRST_DAY or end > LAST_DAY:
-        raise HTTPException(status_code=404, detail="Forecast available only for October 1–31, 2026")
+        raise HTTPException(
+            status_code=404, detail="Forecast available only for October 1–31, 2026"
+        )
     return pd.Timestamp(start), pd.Timestamp(end) + pd.Timedelta(days=1)
 
 
@@ -96,7 +102,9 @@ def create_app(artifact_root=ROOT):
 
     @asynccontextmanager
     async def lifespan(app):
-        app.state.hourly, app.state.daily, app.state.metadata = load_artifacts(artifact_root)
+        app.state.hourly, app.state.daily, app.state.metadata = load_artifacts(
+            artifact_root
+        )
         yield
 
     app = FastAPI(
@@ -107,29 +115,39 @@ def create_app(artifact_root=ROOT):
 
     @app.get("/health")
     def health(request: Request):
-        return {"status": "ready", "hours": len(request.app.state.hourly), "days": len(request.app.state.daily)}
+        return {
+            "status": "ready",
+            "hours": len(request.app.state.hourly),
+            "days": len(request.app.state.daily),
+        }
 
     @app.get("/forecast/hourly", response_model=HourlyResponse)
     def hourly(
         request: Request,
-        start_date: Date | None = Query(default=None),
-        end_date: Date | None = Query(default=None),
+        start_date: Annotated[Date | None, Query()] = None,
+        end_date: Annotated[Date | None, Query()] = None,
     ):
         start, end = date_range(start_date, end_date)
         frame = request.app.state.hourly
         selected = frame.loc[(frame.index >= start) & (frame.index < end)]
-        return {"metadata": request.app.state.metadata, "data": selected.reset_index().to_dict("records")}
+        return {
+            "metadata": request.app.state.metadata,
+            "data": selected.reset_index().to_dict("records"),
+        }
 
     @app.get("/forecast/daily", response_model=DailyResponse)
     def daily(
         request: Request,
-        start_date: Date | None = Query(default=None),
-        end_date: Date | None = Query(default=None),
+        start_date: Annotated[Date | None, Query()] = None,
+        end_date: Annotated[Date | None, Query()] = None,
     ):
         start, end = date_range(start_date, end_date)
         frame = request.app.state.daily
         selected = frame.loc[(frame.index >= start) & (frame.index < end)]
-        return {"metadata": request.app.state.metadata, "data": selected.reset_index().to_dict("records")}
+        return {
+            "metadata": request.app.state.metadata,
+            "data": selected.reset_index().to_dict("records"),
+        }
 
     return app
 

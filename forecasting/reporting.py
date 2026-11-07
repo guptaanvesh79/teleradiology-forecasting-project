@@ -1,8 +1,5 @@
 """Generate a report from saved results; never fit models or select on September."""
 
-import json
-from pathlib import Path
-
 import pandas as pd
 
 from .pipeline import ROOT, read_json
@@ -18,8 +15,13 @@ def limitations(root=ROOT):
     metrics = pd.read_csv(root / "artifacts/final/metrics.csv")
     scores = metrics.loc[metrics.candidate == name].set_index("scope")
     full, tail = scores.loc["all"], scores.loc["last_7_days"]
-    hourly = pd.read_csv(root / f"artifacts/final/2026-09-01_{name}_hourly.csv", parse_dates=["hour_start"]).set_index("hour_start")
-    daily = pd.read_csv(root / f"artifacts/final/2026-09-01_{name}_daily.csv", parse_dates=["date"]).set_index("date")
+    hourly = pd.read_csv(
+        root / f"artifacts/final/2026-09-01_{name}_hourly.csv",
+        parse_dates=["hour_start"],
+    ).set_index("hour_start")
+    daily = pd.read_csv(
+        root / f"artifacts/final/2026-09-01_{name}_daily.csv", parse_dates=["date"]
+    ).set_index("date")
     daily["absolute_error"] = (daily.forecast - daily.actual).abs()
     worst = daily.nlargest(3, "absolute_error")
     examples = "\n".join(
@@ -28,9 +30,18 @@ def limitations(root=ROOT):
         for date, row in worst.iterrows()
     )
     positive = hourly.loc[hourly.actual > 0]
-    positive_coverage = ((positive.actual >= positive.p10) & (positive.actual <= positive.p90)).mean()
-    bad_hours = hourly.assign(error=(hourly.forecast - hourly.actual).abs()).groupby(hourly.index.hour).error.mean().nlargest(3)
-    hours_text = ", ".join(f"{hour:02d}:00 ({value:.1f} studies MAE)" for hour, value in bad_hours.items())
+    positive_coverage = (
+        (positive.actual >= positive.p10) & (positive.actual <= positive.p90)
+    ).mean()
+    bad_hours = (
+        hourly.assign(error=(hourly.forecast - hourly.actual).abs())
+        .groupby(hourly.index.hour)
+        .error.mean()
+        .nlargest(3)
+    )
+    hours_text = ", ".join(
+        f"{hour:02d}:00 ({value:.1f} studies MAE)" for hour, value in bad_hours.items()
+    )
     dev = pd.read_csv(root / "artifacts/development/ranking.csv").set_index("candidate")
     return f"""## Drawbacks and limitations
 
@@ -43,11 +54,11 @@ September is an evaluation result, not a reason to change that selection.
    outages, timezone corrections, or unobserved patients. Future capture changes
    could invalidate the learned clock pattern.
 2. **Unusual-day treatment matters.** Mean development hourly WAPE is
-   {percent(dev.loc['quantile_raw', 'hourly_wape'])} for raw quantile training and
-   {percent(dev.loc['quantile_filtered', 'hourly_wape'])} with the specified
+   {percent(dev.loc["quantile_raw", "hourly_wape"])} for raw quantile training and
+   {percent(dev.loc["quantile_filtered", "hourly_wape"])} with the specified
    near-empty-day exclusion. Validation counts are never removed. Excluding
    plausible capture failures can also remove genuinely low-demand days.
-   On September, raw quantile training has {percent(metrics.loc[(metrics.candidate == 'quantile_raw') & (metrics.scope == 'all'), 'hourly_wape'].iloc[0])}
+   On September, raw quantile training has {percent(metrics.loc[(metrics.candidate == "quantile_raw") & (metrics.scope == "all"), "hourly_wape"].iloc[0])}
    hourly WAPE versus {percent(full.hourly_wape)} for the frozen filtered choice;
    this holdout difference does not change the previously selected method.
 3. **Long-horizon performance is measured, not assumed.** September hourly WAPE
@@ -86,16 +97,7 @@ def build_report(root=ROOT):
     import nbformat
     from nbclient import NotebookClient
 
-    selection = read_json(root / "artifacts/selection.json")
-    manifest = read_json(root / "artifacts/final/manifest.json")
-    metadata = read_json(root / "artifacts/forecast_metadata.json")
     notes = limitations(root)
-    (root / "REPORT.md").write_text(
-        "# Part 1 results\n\nThe executed report is [report.ipynb](report.ipynb).\n\n"
-        f"Selected method: **{selection['selected_candidate']}**. Selection and modelling code "
-        f"were committed at `{manifest['pre_evaluation_commit']}` before September was evaluated.\n\n"
-        f"October point total: **{metadata['forecast_total']:,.1f}** recorded studies.\n\n" + notes
-    )
     markdown = nbformat.v4.new_markdown_cell
     code = nbformat.v4.new_code_cell
     cells = [
@@ -106,30 +108,47 @@ Only the supplied synthetic data is used. These are recorded arrivals, not
 verified underlying demand. Timezone is unspecified. No LLM produces these forecasts.
 This notebook reads saved experiment results and never trains or selects models.
 """),
-        code("""from pathlib import Path
-import json
-import numpy as np
-import pandas as pd
+        code("""import json
+from io import BytesIO
+from pathlib import Path
+
 import matplotlib
-matplotlib.use('Agg')
+import pandas as pd
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from IPython.display import Image, display
 
 ROOT = Path.cwd()
-FIGURES = ROOT / 'artifacts/figures'
-FIGURES.mkdir(parents=True, exist_ok=True)
-selection = json.loads((ROOT / 'artifacts/selection.json').read_text())
-metadata = json.loads((ROOT / 'artifacts/forecast_metadata.json').read_text())
-name = selection['selected_candidate']
-dev = pd.read_csv(ROOT / 'artifacts/development/metrics.csv')
-final = pd.read_csv(ROOT / 'artifacts/final/metrics.csv')
-hourly = pd.read_csv(ROOT / 'forecast.csv', parse_dates=['hour_start']).set_index('hour_start')
-daily = pd.read_csv(ROOT / 'artifacts/daily_forecast.csv', parse_dates=['date']).set_index('date')
-backtest = pd.read_csv(ROOT / f'artifacts/final/2026-09-01_{name}_hourly.csv', parse_dates=['hour_start']).set_index('hour_start')
-backtest_daily = pd.read_csv(ROOT / f'artifacts/final/2026-09-01_{name}_daily.csv', parse_dates=['date']).set_index('date')
-print('Selected before September:', name)
-print('October daily point definition:', metadata['daily_point_estimate'])
-"""),
+
+
+def show_chart(figure):
+    figure.tight_layout()
+    with BytesIO() as image_data:
+        figure.savefig(image_data, format="png")
+        display(Image(data=image_data.getvalue()))
+    plt.close(figure)
+
+
+selection = json.loads((ROOT / "artifacts/selection.json").read_text())
+metadata = json.loads((ROOT / "artifacts/forecast_metadata.json").read_text())
+name = selection["selected_candidate"]
+dev = pd.read_csv(ROOT / "artifacts/development/metrics.csv")
+final = pd.read_csv(ROOT / "artifacts/final/metrics.csv")
+hourly = pd.read_csv(ROOT / "forecast.csv", parse_dates=["hour_start"]).set_index(
+    "hour_start"
+)
+daily = pd.read_csv(
+    ROOT / "artifacts/daily_forecast.csv", parse_dates=["date"]
+).set_index("date")
+backtest = pd.read_csv(
+    ROOT / f"artifacts/final/2026-09-01_{name}_hourly.csv", parse_dates=["hour_start"]
+).set_index("hour_start")
+backtest_daily = pd.read_csv(
+    ROOT / f"artifacts/final/2026-09-01_{name}_daily.csv", parse_dates=["date"]
+).set_index("date")
+print("Selected before September:", name)
+print("October daily point definition:", metadata["daily_point_estimate"])"""),
         markdown("""## Data and input validity
 
 Count study rows per hour on a complete June–September grid (2,928 hours).
@@ -148,15 +167,18 @@ never a future feature, label replacement, or missing-hour repair.
 There are no future actual lags, unknown holiday locations, or study-level
 attributes in the predictors. Predict the whole horizon directly.
 """),
-        code("""quality = json.loads((ROOT / 'artifacts/development/data_quality.json').read_text())
-display(pd.Series(quality, name='June–August diagnostics'))
+        code("""quality = json.loads((ROOT / "artifacts/development/data_quality.json").read_text())
+display(pd.Series(quality, name="June–August diagnostics"))
 fig, ax = plt.subplots(figsize=(10, 3))
-profile = pd.Series(quality['arrivals_by_stored_hour'], dtype=float)
+profile = pd.Series(quality["arrivals_by_stored_hour"], dtype=float)
 profile.index = profile.index.astype(int)
-profile.sort_index().plot.bar(ax=ax, color='#3b82f6')
-ax.set(title='Recorded arrival pattern before September', xlabel='Stored hour (timezone unspecified)', ylabel='June–August studies')
-fig.tight_layout(); fig.savefig(FIGURES / 'recorded_hours.png'); display(Image(filename=str(FIGURES / 'recorded_hours.png'))); plt.close(fig)
-"""),
+profile.sort_index().plot.bar(ax=ax, color="#3b82f6")
+ax.set(
+    title="Recorded arrival pattern before September",
+    xlabel="Stored hour (timezone unspecified)",
+    ylabel="June–August studies",
+)
+show_chart(fig)"""),
         markdown("""## Methods and evaluation protocol
 
 Seasonal naive repeats the final 168 observed hours. Histogram gradient boosting
@@ -174,14 +196,32 @@ WAPE = sum absolute errors / sum actuals; bias = sum(forecast − actual) / sum 
 Total error is signed, forecast minus actual. Percentages with zero actual totals
 are undefined. Last-seven-day metrics use 168 hours independently.
 """),
-        code("""columns = ['origin', 'candidate', 'scope', 'hourly_wape', 'daily_wape', 'bias', 'actual_total', 'forecast_total', 'total_error', 'absolute_total_error', 'absolute_total_error_fraction', 'coverage', 'mean_interval_width', 'daily_coverage', 'quantile_crossing_rate', 'pinball_10', 'pinball_50', 'pinball_90']
-print('ALL DEVELOPMENT RESULTS — fractions, not percentages')
+        code("""columns = [
+    "origin",
+    "candidate",
+    "scope",
+    "hourly_wape",
+    "daily_wape",
+    "bias",
+    "actual_total",
+    "forecast_total",
+    "total_error",
+    "absolute_total_error",
+    "absolute_total_error_fraction",
+    "coverage",
+    "mean_interval_width",
+    "daily_coverage",
+    "quantile_crossing_rate",
+    "pinball_10",
+    "pinball_50",
+    "pinball_90",
+]
+print("ALL DEVELOPMENT RESULTS — fractions, not percentages")
 display(dev[columns])
-print('Selection ranking (mean development full-window errors)')
-display(pd.read_csv(ROOT / 'artifacts/development/ranking.csv'))
-print('FROZEN SEPTEMBER RESULTS — fractions, not percentages')
-display(final[columns])
-"""),
+print("Selection ranking (mean development full-window errors)")
+display(pd.read_csv(ROOT / "artifacts/development/ranking.csv"))
+print("FROZEN SEPTEMBER RESULTS — fractions, not percentages")
+display(final[columns])"""),
         markdown("""## Uncertainty and September errors
 
 Hourly quantile bounds are learned directly. Nonnegative sorting repairs crossing
@@ -195,16 +235,29 @@ not sums of hourly quantiles. Bands are clipped/bracketed to contain nonnegative
 point forecasts. Coverage is measured rather than asserted to be 80%.
 """),
         code("""fig, axes = plt.subplots(2, 1, figsize=(12, 7))
-backtest_daily[['actual', 'forecast']].plot(ax=axes[0])
-axes[0].fill_between(backtest_daily.index, backtest_daily.p10, backtest_daily.p90, alpha=.2, label='Daily residual-based p10–p90')
-axes[0].set(title=f'September daily evaluation: {name}', ylabel='Recorded studies'); axes[0].legend()
-week = backtest.loc['2026-09-24':'2026-09-30']
-axes[1].plot(week.index, week.actual, label='Actual', color='black', linewidth=1)
-axes[1].plot(week.index, week.forecast, label='Point forecast', color='#2563eb', linewidth=1)
-axes[1].fill_between(week.index, week.p10, week.p90, alpha=.2, label='Hourly p10–p90')
-axes[1].set(title='September final seven days', ylabel='Recorded studies per hour', xlabel='Source clock; timezone unspecified'); axes[1].legend()
-fig.tight_layout(); fig.savefig(FIGURES / 'september_evaluation.png'); display(Image(filename=str(FIGURES / 'september_evaluation.png'))); plt.close(fig)
-"""),
+backtest_daily[["actual", "forecast"]].plot(ax=axes[0])
+axes[0].fill_between(
+    backtest_daily.index,
+    backtest_daily.p10,
+    backtest_daily.p90,
+    alpha=0.2,
+    label="Daily residual-based p10–p90",
+)
+axes[0].set(title=f"September daily evaluation: {name}", ylabel="Recorded studies")
+axes[0].legend()
+week = backtest.loc["2026-09-24":"2026-09-30"]
+axes[1].plot(week.index, week.actual, label="Actual", color="black", linewidth=1)
+axes[1].plot(
+    week.index, week.forecast, label="Point forecast", color="#2563eb", linewidth=1
+)
+axes[1].fill_between(week.index, week.p10, week.p90, alpha=0.2, label="Hourly p10–p90")
+axes[1].set(
+    title="September final seven days",
+    ylabel="Recorded studies per hour",
+    xlabel="Source clock; timezone unspecified",
+)
+axes[1].legend()
+show_chart(fig)"""),
         markdown("""## October operations forecast
 
 All available history through September 30 is used to refit the frozen selected
@@ -212,20 +265,30 @@ method. Display daily point totals and ranges for staffing discussions; these
 are recorded-arrival forecasts. If p50 is selected, the daily point is a sum of
 hourly medians, not an expected value or necessarily a daily median.
 """),
-        code("""print(f'October point total: {hourly.forecast.sum():,.1f}')
+        code("""print(f"October point total: {hourly.forecast.sum():,.1f}")
 display(daily.round(1))
 fig, ax = plt.subplots(figsize=(12, 4))
-ax.plot(daily.index, daily.forecast, marker='o', label='Daily point total')
-ax.fill_between(daily.index, daily.p10, daily.p90, alpha=.2, label='Daily residual-based p10–p90')
-ax.set(title='October 2026: daily workload and uncertainty', xlabel='Source calendar date', ylabel='Recorded studies per day')
-ax.legend(); fig.tight_layout(); fig.savefig(FIGURES / 'october_daily.png'); display(Image(filename=str(FIGURES / 'october_daily.png'))); plt.close(fig)
-print('Ten busiest forecast dates/hours (source clock)')
-display(hourly.nlargest(10, 'forecast').round(1))
+ax.plot(daily.index, daily.forecast, marker="o", label="Daily point total")
+ax.fill_between(
+    daily.index, daily.p10, daily.p90, alpha=0.2, label="Daily residual-based p10–p90"
+)
+ax.set(
+    title="October 2026: daily workload and uncertainty",
+    xlabel="Source calendar date",
+    ylabel="Recorded studies per day",
+)
+ax.legend()
+show_chart(fig)
+print("Ten busiest forecast dates/hours (source clock)")
+display(hourly.nlargest(10, "forecast").round(1))
 fig, ax = plt.subplots(figsize=(10, 3))
-hourly.forecast.groupby(hourly.index.hour).mean().plot.bar(ax=ax, color='#2563eb')
-ax.set(title='October: typical workload by stored hour', xlabel='Stored hour', ylabel='Mean point forecast across October dates')
-fig.tight_layout(); fig.savefig(FIGURES / 'october_busiest_hours.png'); display(Image(filename=str(FIGURES / 'october_busiest_hours.png'))); plt.close(fig)
-"""),
+hourly.forecast.groupby(hourly.index.hour).mean().plot.bar(ax=ax, color="#2563eb")
+ax.set(
+    title="October: typical workload by stored hour",
+    xlabel="Stored hour",
+    ylabel="Mean point forecast across October dates",
+)
+show_chart(fig)"""),
         markdown(notes),
         markdown("""## Reproducibility and handoff
 
@@ -233,16 +296,25 @@ fig.tight_layout(); fig.savefig(FIGURES / 'october_busiest_hours.png'); display(
 forecast and the separately calibrated daily artifact. The pytest files and
 Docker test target were removed at the user's request. Historical verification
 results refer to the original Part 1 commit. See README for the Docker service
-command, forecast verification script, and stage commands.
+command and stage commands. Charts are embedded in this notebook.
 The selection, checksums, and pre-September commit are recorded under `artifacts/`.
 AI coding assistance and concrete corrections are disclosed in `AI_USE_LOG.md`.
 Part 2 is not included and will start only after committing completed Part 1.
 """),
     ]
-    notebook = nbformat.v4.new_notebook(cells=cells, metadata={
-        "kernelspec": {"name": "main_env", "display_name": "Python (main_env)", "language": "python"},
-        "language_info": {"name": "python", "version": "3.13.18"},
-    })
-    executed = NotebookClient(notebook, timeout=120, kernel_name="main_env").execute(cwd=str(root))
+    notebook = nbformat.v4.new_notebook(
+        cells=cells,
+        metadata={
+            "kernelspec": {
+                "name": "main_env",
+                "display_name": "Python (main_env)",
+                "language": "python",
+            },
+            "language_info": {"name": "python", "version": "3.13.18"},
+        },
+    )
+    executed = NotebookClient(notebook, timeout=120, kernel_name="main_env").execute(
+        cwd=str(root)
+    )
     nbformat.write(executed, root / "report.ipynb")
-    print("Saved executed report.ipynb, REPORT.md, and artifacts/figures/", flush=True)
+    print("Saved executed report.ipynb with embedded charts", flush=True)

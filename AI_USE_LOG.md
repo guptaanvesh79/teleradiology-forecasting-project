@@ -28,4 +28,16 @@ Part 2 usage will be appended only after the Part 1 freeze.
 
 On 2026-11-08, the user requested removal of the pytest files and Docker test
 target. The test results above describe the original Part 1 commit; the current
-checkout retains the environment and live-service verification scripts.
+verification scripts were subsequently removed as part of the minimum-layout
+cleanup. The earlier counts are historical results, not a current test suite.
+
+Codex also resolved Ruff diagnostics and formatting on 2026-11-08. All saved
+backtest and October predictions and API responses were compared with the
+pre-cleanup version. The original selection and results remain unchanged;
+checksum-protected source changes are recorded in the separate Ruff maintenance
+record rather than replacing the original pre-September provenance.
+
+The user also requested the minimum project layout. Optional helper scripts,
+environment snapshots, duplicate Markdown report, separate chart files, and
+editor/cache files were removed. The notebook retains the report and embeds its
+charts directly; the final training audit was moved under `artifacts/final/`.

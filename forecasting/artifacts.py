@@ -27,12 +27,16 @@ def validate_hourly(frame):
     if not strings.str.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}").all():
         raise ValueError("hour_start must use YYYY-MM-DD HH:MM:SS without a timezone")
     try:
-        index = pd.DatetimeIndex(pd.to_datetime(strings, format="%Y-%m-%d %H:%M:%S", errors="raise"))
+        index = pd.DatetimeIndex(
+            pd.to_datetime(strings, format="%Y-%m-%d %H:%M:%S", errors="raise")
+        )
     except (ValueError, TypeError) as error:
         raise ValueError("Invalid hourly timestamp") from error
     expected = pd.date_range(FORECAST_ORIGIN, FORECAST_END, freq="h", inclusive="left")
     if len(frame) != 744 or not index.equals(expected):
-        raise ValueError("Require exactly 744 ordered, unique, consecutive October hours")
+        raise ValueError(
+            "Require exactly 744 ordered, unique, consecutive October hours"
+        )
     validate_bounds(frame)
     return frame.set_index(index)[["forecast", "p10", "p90"]].rename_axis("hour_start")
 
@@ -41,7 +45,9 @@ def validate_daily(frame, hourly):
     if list(frame.columns) != DAILY_COLUMNS:
         raise ValueError(f"Daily CSV columns must be {DAILY_COLUMNS}")
     try:
-        index = pd.DatetimeIndex(pd.to_datetime(frame.date, format="%Y-%m-%d", errors="raise"))
+        index = pd.DatetimeIndex(
+            pd.to_datetime(frame.date, format="%Y-%m-%d", errors="raise")
+        )
     except (ValueError, TypeError) as error:
         raise ValueError("Invalid daily date") from error
     expected = pd.date_range(FORECAST_ORIGIN, FORECAST_END, freq="D", inclusive="left")
@@ -49,6 +55,10 @@ def validate_daily(frame, hourly):
         raise ValueError("Require exactly 31 ordered October days")
     validate_bounds(frame)
     result = frame.set_index(index)[["forecast", "p10", "p90"]].rename_axis("date")
-    if not np.allclose(result.forecast, hourly.forecast.resample("D").sum(), rtol=0, atol=1e-6):
-        raise ValueError("Daily point forecasts must equal sums of saved hourly point forecasts")
+    if not np.allclose(
+        result.forecast, hourly.forecast.resample("D").sum(), rtol=0, atol=1e-6
+    ):
+        raise ValueError(
+            "Daily point forecasts must equal sums of saved hourly point forecasts"
+        )
     return result

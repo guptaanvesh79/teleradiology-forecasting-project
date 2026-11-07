@@ -1,15 +1,13 @@
 .git
-.vscode
 __pycache__
 **/__pycache__
 .pytest_cache
+.ruff_cache
 .ipynb_checkpoints
 data
 report.ipynb
 artifacts/development
 artifacts/final
-artifacts/figures
-requirements-macos.lock.txt
 .env
 .venv
 main_env

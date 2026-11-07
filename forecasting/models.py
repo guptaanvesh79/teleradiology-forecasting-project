@@ -22,11 +22,15 @@ def training_mask(history, candidate):
 def validate_history(history, future):
     if len(history) < 14 * 24:
         raise ValueError("At least 14 complete days of history are required")
-    if not history.index.equals(pd.date_range(history.index[0], periods=len(history), freq="h")):
+    if not history.index.equals(
+        pd.date_range(history.index[0], periods=len(history), freq="h")
+    ):
         raise ValueError("History must be a complete, ordered hourly series")
     if not np.isfinite(history).all() or (history < 0).any():
         raise ValueError("History counts must be finite and nonnegative")
-    expected = pd.date_range(history.index[-1] + pd.Timedelta(hours=1), periods=len(future), freq="h")
+    expected = pd.date_range(
+        history.index[-1] + pd.Timedelta(hours=1), periods=len(future), freq="h"
+    )
     if len(future) == 0 or not future.equals(expected):
         raise ValueError("Future must be consecutive hours beginning after history")
 
@@ -45,7 +49,9 @@ def fit_predict(history, future, candidate: Candidate):
         y_train = history.loc[mask].to_numpy(dtype=float)
         x_future = calendar_features(future)
         if not len(y_train):
-            raise ValueError("No training observations remain after sparse-day filtering")
+            raise ValueError(
+                "No training observations remain after sparse-day filtering"
+            )
         with threadpool_limits(limits=1):
             if not y_train.any():
                 values = np.zeros((len(future), 3))
@@ -54,19 +60,29 @@ def fit_predict(history, future, candidate: Candidate):
                 point = model.fit(x_train, y_train).predict(x_future)
                 values = np.column_stack([point, point, point])
             elif candidate.family == "quantile":
-                values = np.column_stack([
-                    HistGradientBoostingRegressor(loss="quantile", quantile=q, **PARAMETERS)
-                    .fit(x_train, y_train).predict(x_future)
-                    for q in (0.1, 0.5, 0.9)
-                ])
+                values = np.column_stack(
+                    [
+                        HistGradientBoostingRegressor(
+                            loss="quantile", quantile=q, **PARAMETERS
+                        )
+                        .fit(x_train, y_train)
+                        .predict(x_future)
+                        for q in (0.1, 0.5, 0.9)
+                    ]
+                )
             else:
                 raise ValueError(f"Unknown model family: {candidate.family}")
         crossings = (values[:, 0] > values[:, 1]) | (values[:, 1] > values[:, 2])
         values = np.sort(np.maximum(values, 0), axis=1)
-    return pd.DataFrame({
-        "forecast": values[:, 1], "p10": values[:, 0], "p90": values[:, 2],
-        "crossed_before_sort": crossings,
-    }, index=future).rename_axis("hour_start")
+    return pd.DataFrame(
+        {
+            "forecast": values[:, 1],
+            "p10": values[:, 0],
+            "p90": values[:, 2],
+            "crossed_before_sort": crossings,
+        },
+        index=future,
+    ).rename_axis("hour_start")
 
 
 def calibration_residuals(history, candidate):
@@ -76,8 +92,12 @@ def calibration_residuals(history, candidate):
     for weeks in range(CALIBRATION_WEEKS, 0, -1):
         inner_origin = origin - pd.Timedelta(weeks=weeks)
         future = pd.date_range(inner_origin, periods=168, freq="h")
-        prediction = fit_predict(history.loc[history.index < inner_origin], future, candidate)
-        pieces.append((history.reindex(future) - prediction.forecast).rename("residual"))
+        prediction = fit_predict(
+            history.loc[history.index < inner_origin], future, candidate
+        )
+        pieces.append(
+            (history.reindex(future) - prediction.forecast).rename("residual")
+        )
     residuals = pd.concat(pieces)
     if residuals.isna().any() or residuals.index.max() >= origin:
         raise ValueError("Calibration must contain only observed pre-origin hours")

@@ -9,8 +9,14 @@ import pandas as pd
 from .config import DATA_END, DATA_START, SPARSE_DAY_RATIO
 
 REQUIRED_COLUMNS = (
-    "study_id", "arrival_time", "hospital_id", "modality",
-    "specialty_required", "criticality", "patient_location", "day_total_studies",
+    "study_id",
+    "arrival_time",
+    "hospital_id",
+    "modality",
+    "specialty_required",
+    "criticality",
+    "patient_location",
+    "day_total_studies",
 )
 
 
@@ -24,20 +30,31 @@ def load_studies(path):
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
     if frame.empty or frame[list(REQUIRED_COLUMNS)].isna().any().any():
-        raise ValueError("The studies file must be nonempty with no missing required values")
+        raise ValueError(
+            "The studies file must be nonempty with no missing required values"
+        )
     if frame.study_id.duplicated().any():
         raise ValueError("Duplicate study_id values")
     try:
-        timestamps = pd.to_datetime(frame.arrival_time, format="%Y-%m-%d %H:%M:%S", errors="raise")
+        timestamps = pd.to_datetime(
+            frame.arrival_time, format="%Y-%m-%d %H:%M:%S", errors="raise"
+        )
     except (ValueError, TypeError) as error:
-        raise ValueError("Invalid arrival_time; expected timezone-naive YYYY-MM-DD HH:MM:SS") from error
+        raise ValueError(
+            "Invalid arrival_time; expected timezone-naive YYYY-MM-DD HH:MM:SS"
+        ) from error
     if timestamps.dt.tz is not None:
-        raise ValueError("Timezone-aware arrivals are not supported; preserve the source clock")
+        raise ValueError(
+            "Timezone-aware arrivals are not supported; preserve the source clock"
+        )
     if not timestamps.between(DATA_START, DATA_END, inclusive="left").all():
         raise ValueError("Arrival timestamp outside June 1 through September 30, 2026")
     totals = pd.to_numeric(frame.day_total_studies, errors="coerce")
-    if (not np.isfinite(totals).all() or (totals < 0).any()
-            or (totals != np.floor(totals)).any()):
+    if (
+        not np.isfinite(totals).all()
+        or (totals < 0).any()
+        or (totals != np.floor(totals)).any()
+    ):
         raise ValueError("day_total_studies must contain nonnegative integer counts")
     frame["arrival_time"] = timestamps
     frame["day_total_studies"] = totals.astype("int64")
@@ -49,9 +66,16 @@ def hourly_counts(frame, start=DATA_START, end=DATA_END):
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     if start >= end or start != start.floor("h") or end != end.floor("h"):
         raise ValueError("Require an increasing pair of whole-hour boundaries")
-    arrivals = frame.loc[frame.arrival_time.between(start, end, inclusive="left"), "arrival_time"]
+    arrivals = frame.loc[
+        frame.arrival_time.between(start, end, inclusive="left"), "arrival_time"
+    ]
     index = pd.date_range(start, end, freq="h", inclusive="left", name="hour_start")
-    return arrivals.groupby(arrivals.dt.floor("h")).size().reindex(index, fill_value=0).rename("actual")
+    return (
+        arrivals.groupby(arrivals.dt.floor("h"))
+        .size()
+        .reindex(index, fill_value=0)
+        .rename("actual")
+    )
 
 
 def day_audit(history):
@@ -59,13 +83,15 @@ def day_audit(history):
     totals = history.resample("D").sum()
     medians = totals.groupby(totals.index.day_of_week).median()
     reference = pd.Series(totals.index.day_of_week.map(medians), index=totals.index)
-    return pd.DataFrame({
-        "recorded_total": totals,
-        "weekday_median": reference,
-        "sparse_threshold": SPARSE_DAY_RATIO * reference,
-        "near_empty": (reference > 0) & (totals < SPARSE_DAY_RATIO * reference),
-        "empty_hours": history.eq(0).resample("D").sum(),
-    }).rename_axis("date")
+    return pd.DataFrame(
+        {
+            "recorded_total": totals,
+            "weekday_median": reference,
+            "sparse_threshold": SPARSE_DAY_RATIO * reference,
+            "near_empty": (reference > 0) & (totals < SPARSE_DAY_RATIO * reference),
+            "empty_hours": history.eq(0).resample("D").sum(),
+        }
+    ).rename_axis("date")
 
 
 def source_consistency(frame):
