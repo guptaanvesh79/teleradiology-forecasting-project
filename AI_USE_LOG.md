@@ -20,8 +20,12 @@ Docker cask also required administrator-only paths even with binary linking
 disabled; the official downloaded app was installed directly and user-level CLI
 links were verified with Docker's hello-world container.
 
-Checks include synthetic feature/metric examples, tests that alter future counts
+Original checks included synthetic feature/metric examples, tests that altered future counts
 without changing earlier forecasts, file/checksum and Git freeze checks, local
 and container tests, notebook execution, and comparisons of API results with the
 saved CSVs. The development selection is committed before September evaluation.
 Part 2 usage will be appended only after the Part 1 freeze.
+
+On 2026-11-08, the user requested removal of the pytest files and Docker test
+target. The test results above describe the original Part 1 commit; the current
+checkout retains the environment and live-service verification scripts.

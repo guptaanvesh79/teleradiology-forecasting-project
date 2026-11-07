@@ -27,26 +27,19 @@ Responses explicitly identify the model, estimate definition, and unknown timezo
 Missing, modified, or invalid artifacts fail startup with a diagnostic rather
 than silently training or serving inconsistent totals. The service trains nothing.
 
-## Run the tests
+## Verify the saved forecasts
 
-The single Docker test command builds a separate test target:
-
-```bash
-docker compose run --build --rm tests
-```
-
-The test service is behind a Compose profile and is not launched by normal startup.
-Locally, activate `main_env` and run `python -m pytest -q`.
-Tests use synthetic fixtures, including small 8-iteration estimators for speed;
-the real backtests and final forecast use the specified 200 iterations.
+The pytest files and Docker test target were removed at the user's request.
+The original assignment still requires pytest tests for features and endpoints.
 After starting the service, `python scripts/verify_service.py` checks every
 live forecast row against the saved artifacts, plus totals and error responses.
-Verification completed with **45 local tests and 45 Linux-container tests passing**,
-an executed notebook containing four embedded charts, and all 744 hourly/31 daily
-live API rows matching their CSV artifacts. The runtime image reports Python
+The original Part 1 commit passed 45 local and 45 Linux-container tests before
+the test files were removed. Those are historical results, not a runnable suite
+in the current checkout. The executed notebook contains four embedded charts,
+and all 744 hourly/31 daily live API rows matched their CSV artifacts.
+The runtime image reports Python
 3.13.18 on Linux ARM64 and excludes JupyterLab. Its package versions are saved in
-`artifacts/container_environment.json`. The pinned FastAPI/Starlette release emits
-an upstream HTTPX TestClient deprecation warning; the tests pass without suppression.
+`artifacts/container_environment.json`.
 
 ## Selected model and September evaluation
 
@@ -174,7 +167,7 @@ For scripts or shells that do not initialize Conda, use the absolute interpreter
 ```
 
 - `requirements.txt` contains forecasting and service dependencies.
-- `requirements-dev.txt` includes runtime dependencies plus pytest, charts, and
+- `requirements-dev.txt` includes runtime dependencies plus charts and
   notebook tools. SciPy and the other transitive dependencies install automatically.
 - `requirements-macos.lock.txt` records all installed Python packages after
   verification. It is a Python 3.13/macOS snapshot, not a Linux Docker lock file.
@@ -200,7 +193,6 @@ python --version
 python -c "import sys; print(sys.executable)"
 python -m pip check
 python scripts/verify_environment.py
-python -m pytest --version
 ```
 
 The smoke check verifies every direct package version and import, fits a small
@@ -241,7 +233,7 @@ docker run --rm hello-world
 
 Installation references: [Docker Desktop for Mac](https://docs.docker.com/desktop/setup/install/mac-install/)
 and the [Homebrew Docker Desktop cask](https://formulae.brew.sh/cask/docker-desktop).
-The service image and test target are defined in `Dockerfile` and `compose.yaml`.
+The service image is defined in `Dockerfile` and `compose.yaml`.
 
 ## Verified installation
 

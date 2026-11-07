@@ -230,9 +230,10 @@ fig.tight_layout(); fig.savefig(FIGURES / 'october_busiest_hours.png'); display(
         markdown("""## Reproducibility and handoff
 
 `forecast.csv` is the 744-row submission. API endpoints serve this same saved
-forecast and the separately calibrated daily artifact. Tests cover features,
-origin safety, metrics, CSV invariants, date validation, and service responses.
-See README for the single Docker service/test commands and stage commands.
+forecast and the separately calibrated daily artifact. The pytest files and
+Docker test target were removed at the user's request. Historical verification
+results refer to the original Part 1 commit. See README for the Docker service
+command, forecast verification script, and stage commands.
 The selection, checksums, and pre-September commit are recorded under `artifacts/`.
 AI coding assistance and concrete corrections are disclosed in `AI_USE_LOG.md`.
 Part 2 is not included and will start only after committing completed Part 1.
