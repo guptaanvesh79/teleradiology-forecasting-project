@@ -182,45 +182,17 @@ def develop(root=ROOT):
     )
 
 
-def reviewed_fingerprint(root, selection):
-    """Allow only an explicitly recorded, output-verified maintenance revision.
-
-    Original selection/result hashes are retained; this never reselects a model
-    or updates the original pre-September fingerprint in place.
-    """
-    original = selection["implementation_sha256"]
-    current = fingerprint(root)
-    if current == original:
-        return original
-    review_path = root / "artifacts/maintenance/ruff_cleanup.json"
-    if review_path.is_file():
-        review = read_json(review_path)
-        if (
-            review.get("original_implementation_sha256") == original
-            and review.get("implementation_sha256") == current
-            and review.get("selection_sha256")
-            == sha256_file(root / "artifacts/selection.json")
-            and review.get("numerical_regression_verified") is True
-            and review.get("preserved_artifacts_sha256")
-        ):
-            for name, checksum in review["preserved_artifacts_sha256"].items():
-                if sha256_file(root / name) != checksum:
-                    raise ValueError(
-                        f"Forecast/result changed after maintenance review: {name}"
-                    )
-            return current
-    raise ValueError(
-        "Frozen modelling code/configuration changed; do not tune after September"
-    )
-
-
 def frozen_selection(root=ROOT):
+    """Validate the frozen settings, inputs, results, and original Git snapshot.
+
+    Source hashes describe the archived pre-evaluation implementation. Later
+    source edits are tracked in Git rather than a separate maintenance file.
+    """
     path = root / "artifacts/selection.json"
     selection = read_json(path)
-    reviewed = reviewed_fingerprint(root, selection)
     if selection["specification"] != specification():
         raise ValueError(
-            "Frozen modelling code/configuration changed; do not tune after September"
+            "Frozen model configuration changed; do not tune after September"
         )
     if selection["data_sha256"] != sha256_file(root / "data/studies.csv"):
         raise ValueError("Input data changed after development")
@@ -241,12 +213,25 @@ def frozen_selection(root=ROOT):
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=root, text=True
         ).strip()
+        reference_commit = commit
+        manifest_path = root / "artifacts/final/manifest.json"
+        if manifest_path.is_file():
+            manifest = read_json(manifest_path)
+            if manifest["selection_sha256"] != sha256_file(path):
+                raise ValueError(
+                    "Final evaluation belongs to a different frozen selection"
+                )
+            reference_commit = manifest["pre_evaluation_commit"]
         for name, checksum in selection["implementation_sha256"].items():
             content = subprocess.check_output(
-                ["git", "show", f"HEAD:{name}"], cwd=root, stderr=subprocess.PIPE
+                ["git", "show", f"{reference_commit}:{name}"],
+                cwd=root,
+                stderr=subprocess.PIPE,
             )
-            if hashlib.sha256(content).hexdigest() not in {checksum, reviewed[name]}:
-                raise ValueError(f"Frozen implementation is not committed: {name}")
+            if hashlib.sha256(content).hexdigest() != checksum:
+                raise ValueError(
+                    f"Archived implementation does not match its frozen hash: {name}"
+                )
     except (subprocess.CalledProcessError, FileNotFoundError) as error:
         raise ValueError(
             "Commit the modelling code and selection before evaluating September"

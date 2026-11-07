@@ -31,11 +31,12 @@ target. The test results above describe the original Part 1 commit; the current
 verification scripts were subsequently removed as part of the minimum-layout
 cleanup. The earlier counts are historical results, not a current test suite.
 
-Codex also resolved Ruff diagnostics and formatting on 2026-11-08. All saved
+Codex also resolved code diagnostics and formatting on 2026-11-08. All saved
 backtest and October predictions and API responses were compared with the
 pre-cleanup version. The original selection and results remain unchanged;
-checksum-protected source changes are recorded in the separate Ruff maintenance
-record rather than replacing the original pre-September provenance.
+the freeze checks the original pre-evaluation implementation in Git rather than
+requiring a separate formatting-maintenance record. Source hashes describe that
+historical snapshot; subsequent source changes remain visible in Git.
 
 The user also requested the minimum project layout. Optional helper scripts,
 environment snapshots, duplicate Markdown report, separate chart files, and

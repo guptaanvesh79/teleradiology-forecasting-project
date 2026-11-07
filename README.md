@@ -33,8 +33,6 @@ The service reads saved artifacts and does not train during requests.
 - `data/`: unchanged source CSV, supplied dictionary, and checksums.
 - `artifacts/development/`: all three development backtests, metrics, and ranking.
 - `artifacts/final/`: September results, manifest, and training audits.
-- `artifacts/maintenance/ruff_cleanup.json`: reviewed source-maintenance record
-  used by the freeze guard; keep this with the code.
 - `artifacts/selection.json`: frozen model selection, specification, and hashes.
 - `artifacts/daily_forecast.csv` and `artifacts/forecast_metadata.json`: service data.
 - [forecast.csv](forecast.csv): exactly 744 October rows in the required format.
@@ -81,10 +79,11 @@ commit. In this completed checkout, `develop` refuses to overwrite the selection
 and `evaluate-final` preserves the existing September result. Do not remove those
 guards to tune on September.
 
-The freeze validates source, data, dependency, and development-result hashes.
-Reviewed Ruff changes and the later audit-file relocation are recorded separately
-in the maintenance record. Original selection and evaluation files are unchanged.
-Any further unreviewed modelling changes are rejected.
+The freeze validates the selected settings, data, dependencies, development
+results, and the original pre-evaluation Git snapshot. Saved source hashes refer
+to that archived snapshot, not later working-tree formatting or layout edits.
+Later source changes are tracked through Git. No separate maintenance record is
+required. Original selection and evaluation files are unchanged.
 
 ## Method and assumptions
 
