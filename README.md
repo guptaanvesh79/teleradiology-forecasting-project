@@ -39,6 +39,32 @@ The test service is behind a Compose profile and is not launched by normal start
 Locally, activate `main_env` and run `python -m pytest -q`.
 Tests use synthetic fixtures, including small 8-iteration estimators for speed;
 the real backtests and final forecast use the specified 200 iterations.
+After starting the service, `python scripts/verify_service.py` checks every
+live forecast row against the saved artifacts, plus totals and error responses.
+Verification completed with **45 local tests and 45 Linux-container tests passing**,
+an executed notebook containing four embedded charts, and all 744 hourly/31 daily
+live API rows matching their CSV artifacts. The runtime image reports Python
+3.13.18 on Linux ARM64 and excludes JupyterLab. Its package versions are saved in
+`artifacts/container_environment.json`. The pinned FastAPI/Starlette release emits
+an upstream HTTPX TestClient deprecation warning; the tests pass without suppression.
+
+## Selected model and September evaluation
+
+The development selection is **quantile_filtered**, with mean development hourly
+WAPE **19.95%** versus **24.11%** for seasonal naive. The selection and modelling
+code were committed before opening September results.
+
+| September metric | Selected quantile model | Seasonal naive |
+|---|---:|---:|
+| Hourly WAPE | 15.85% | 19.16% |
+| Daily-total WAPE | 13.12% | 15.44% |
+| Hourly p10–p90 coverage | 91.25% | 86.25% |
+
+The selected model's final-week hourly WAPE is **15.32%**, hourly coverage is
+**92.86%**, and full-month daily coverage is **76.67%**. These measured ranges
+do not guarantee 80% coverage. Raw quantile training scores slightly better on
+September (15.71% hourly WAPE), but the development choice is retained.
+October's point total is **43,974.8**; October actuals are unavailable.
 
 ## Results and forecast artifacts
 

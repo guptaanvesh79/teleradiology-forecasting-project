@@ -47,6 +47,9 @@ September is an evaluation result, not a reason to change that selection.
    {percent(dev.loc['quantile_filtered', 'hourly_wape'])} with the specified
    near-empty-day exclusion. Validation counts are never removed. Excluding
    plausible capture failures can also remove genuinely low-demand days.
+   On September, raw quantile training has {percent(metrics.loc[(metrics.candidate == 'quantile_raw') & (metrics.scope == 'all'), 'hourly_wape'].iloc[0])}
+   hourly WAPE versus {percent(full.hourly_wape)} for the frozen filtered choice;
+   this holdout difference does not change the previously selected method.
 3. **Long-horizon performance is measured, not assumed.** September hourly WAPE
    is {percent(full.hourly_wape)} overall and {percent(tail.hourly_wape)} in the
    last seven days; bias is {percent(full.bias)} and {percent(tail.bias)}.
@@ -65,7 +68,7 @@ September is an evaluation result, not a reason to change that selection.
    No future hospital staffing, onboarding, hospital volumes, or outages are
    known. Hourly quantiles are marginal estimates, not joint sample paths.
    A sum of hourly medians is a daily point forecast, not a mathematical
-   expectation or necessarily the daily median. Ranges are not clinical advice.
+   expectation or necessarily the daily median.
 6. **Errors are concentrated.** The largest September daily absolute errors are:
 
 {examples}

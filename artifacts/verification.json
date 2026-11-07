@@ -1,0 +1,20 @@
+{
+  "local_pytest_passed": 45,
+  "docker_pytest_passed": 45,
+  "notebook_executed_code_cells": 5,
+  "notebook_embedded_charts": 4,
+  "live_api_verified_hourly_rows": 744,
+  "live_api_verified_daily_rows": 31,
+  "live_api_verified_filters_and_error_responses": true,
+  "selected_candidate": "quantile_filtered",
+  "pre_holdout_commit": "a929ab4eb675156753dddcfbccb1f8e9fbf2fc7d",
+  "frozen_modelling_code_unchanged": true,
+  "forecast_total": 43974.7531397196,
+  "forecasts_use_llms": false,
+  "sha256": {
+    "forecast.csv": "5d917ff1034879e498ce6d4f643a016899f337ed6f6c4317cf96b41d5aef268d",
+    "report.ipynb": "d86e30aa3fe0ec96fd8b29e8e70c9a58a927688fbb22a1101323f67c12ca8a24",
+    "artifacts/daily_forecast.csv": "d48912da4edc8db84bab3f6ddda2f53e1c5838f72bf7adf870a8ddf839b0d6ec",
+    "artifacts/final/metrics.csv": "7efdec19311f74e28cdead1c4319629038fa4a798dde976d202d911aaea4eb7f"
+  }
+}
