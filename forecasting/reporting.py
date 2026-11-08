@@ -187,6 +187,12 @@ p10/p50/p90. Each learned family has raw and sparse-day-filtered variants.
 Parameters are fixed at 200 iterations, learning rate 0.05, 15 leaves, minimum
 20 samples per leaf, L2=1, seed=42, and no automatic early-stopping split.
 
+Histogram gradient boosting learns nonlinear hour/weekday interactions from the
+small tabular calendar dataset without feature scaling and runs on a CPU. One
+installed estimator supports both count-oriented Poisson and quantile losses.
+Direct quantile regression learns asymmetric, time-varying hourly ranges rather
+than adding a fixed band to a point forecast.
+
 Development origins are July 7, July 21, and August 4, with 28-day horizons.
 Selection minimizes mean development hourly WAPE, then daily WAPE, then simplicity.
 September 1–30 is evaluated only after committing the selection and modelling code.
@@ -293,10 +299,17 @@ show_chart(fig)"""),
         markdown("""## Reproducibility and handoff
 
 `forecast.csv` is the 744-row submission. API endpoints serve this same saved
-forecast and the separately calibrated daily artifact. The pytest files and
-Docker test target were removed at the user's request. Historical verification
-results refer to the original Part 1 commit. See README for the Docker service
-command and stage commands. Charts are embedded in this notebook.
+forecast and the separately calibrated daily artifact. The permanent pytest
+suite covers feature values, input validation, origin-safe training/calibration,
+forecast contracts, API responses, date filters, and error handling. Tests use
+synthetic temporary artifacts and do not overwrite submitted forecasts.
+
+Run the service with `docker compose up --build` and the tests with
+`docker compose run --build --rm tests`. The test service is profile-isolated
+from normal API startup; notebook tooling is excluded from the service image.
+See README for local testing and pipeline stage commands. Charts are embedded
+in this notebook. The original 45-test run is historical; current verification
+is recorded in README.
 The selection, checksums, and pre-September commit are recorded under `artifacts/`.
 AI coding assistance and concrete corrections are disclosed in `AI_USE_LOG.md`.
 Part 2 is not included and will start only after committing completed Part 1.

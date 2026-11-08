@@ -9,3 +9,10 @@ COPY artifacts/daily_forecast.csv artifacts/forecast_metadata.json ./artifacts/
 USER 10001:10001
 EXPOSE 8000
 CMD ["python", "-m", "uvicorn", "forecasting.api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+FROM service AS tests
+USER root
+RUN python -m pip install --no-cache-dir --only-binary=:all: pytest==9.2.0
+COPY tests ./tests
+USER 10001:10001
+CMD ["python", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]

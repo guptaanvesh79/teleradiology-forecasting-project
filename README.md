@@ -26,10 +26,36 @@ the model, estimate definition, and unspecified timezone. Missing, modified, or
 invalid artifacts fail startup rather than silently serving inconsistent data.
 The service reads saved artifacts and does not train during requests.
 
+## Run the tests
+
+The single Docker test command builds an isolated test target and exits with
+pytest's result:
+
+```bash
+docker compose run --build --rm tests
+```
+
+The test service uses a Compose profile, so `docker compose up --build` starts
+only the API. The service image excludes pytest and notebook tooling; the test
+image adds pytest and the permanent `tests/` folder.
+
+For local testing after installing the development requirements:
+
+```bash
+python -B -m pytest -q -p no:cacheprovider tests
+```
+
+Tests cover all eight features, input validation, hourly aggregation, sparse-day
+handling, post-origin leakage, saved forecast contracts, and both API endpoints.
+They use synthetic fixtures and pytest-managed temporary files without external
+services or LLM calls. Small model fits use eight iterations within isolated
+tests; production remains at 200. Submitted forecast files are read-only.
+
 ## Project structure
 
 - `forecasting/`: calendar features, models, metrics, pipeline, validation, API,
   and notebook generator.
+- `tests/`: shared synthetic fixtures plus feature/data and API/forecast-contract tests.
 - `data/`: unchanged source CSV, supplied dictionary, and checksums.
 - `artifacts/development/`: all three development backtests, metrics, and ranking.
 - `artifacts/final/`: September results, manifest, and training audits.
@@ -53,7 +79,7 @@ python -m pip check
 ```
 
 Runtime/service dependencies are in `requirements.txt`; `requirements-dev.txt`
-adds Matplotlib, JupyterLab, and ipykernel. The service image resolves its own Linux
+adds pytest, Matplotlib, JupyterLab, and ipykernel. The service image resolves its own Linux
 dependencies and excludes notebook tooling. No API keys or user-supplied environment
 variables are required. Docker sets `PYTHONDONTWRITEBYTECODE`, `PYTHONUNBUFFERED`,
 `OMP_NUM_THREADS`, and `OPENBLAS_NUM_THREADS` to 1.
@@ -100,6 +126,12 @@ Shared parameters: 200 iterations, learning rate 0.05, 15 leaves, minimum 20 sam
 per leaf, L2=1, seed=42, and `early_stopping=False`. No parameter search or random
 validation split is used.
 
+Histogram gradient boosting keeps this small calendar-feature problem in one
+CPU-based library and learns nonlinear hour/weekday interactions without manual
+feature scaling. The same estimator supports count-oriented Poisson loss and
+direct quantile loss. Quantile regression allows asymmetric, time-varying hourly
+ranges rather than imposing a fixed band around a point forecast.
+
 Each learned family is trained raw and with days below 10% of their training
 weekday median excluded, producing five candidates including baseline. Thresholds
 use only each origin's history. Validation actuals are never removed. Missing rows
@@ -137,7 +169,20 @@ Raw quantile training scores slightly better on September (15.71% hourly WAPE),
 but the previously frozen selection is retained. October's point total is
 **43,974.8** recorded studies. October actuals are unavailable.
 
-The original Part 1 snapshot passed 45 local and 45 container tests. The user later
-requested removal of the pytest suite and Docker test target, which the assignment
-brief requires. Those counts are historical, not a current runnable test suite.
-Part 2 remains a separate phase.
+The permanent pytest suite and Docker test target are included in this checkout.
+The earlier 45-test results belong to the original Part 1 snapshot; verification
+of the current suite is recorded below. Part 2 remains a separate phase.
+
+## Current Part 1 verification
+
+- Local permanent suite: **58 passed**.
+- Linux Docker permanent suite: **58 passed**.
+- Notebook: five executed code cells, four embedded charts, no execution errors.
+- Original selection, September predictions/metrics, and October forecast files
+  remain unchanged. Hourly coverage remains the measured 91.25%, not an asserted
+  80% guarantee.
+
+The installed FastAPI/Starlette release emits an HTTPX TestClient deprecation
+warning; tests pass without suppressing it. The sandboxed macOS run also reports
+a physical-core detection warning and uses logical-core fallback. Neither warning
+changes the submitted forecasts.

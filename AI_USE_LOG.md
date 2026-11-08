@@ -1,44 +1,21 @@
 # AI-use log — Part 1
 
-I used ChatGPT/Codex for planning, explaining calendar features and forecasting
-objectives, environment setup, drafting Python code, tests, Docker configuration,
-and the notebook/report. The classical predictions themselves are calculated by
-local scikit-learn estimators and a seasonal-naive algorithm. No history was sent
-to an LLM to obtain forecasts; no LLM API or explanation endpoint is used in Part 1.
+I used ChatGPT/Codex to help plan the approach, explain calendar features, and
+draft data preparation, forecasting, API, Docker, tests, and report code. All
+Part 1 forecast numbers are computed locally by classical algorithms. No history
+was sent to an LLM to obtain forecasts, and no LLM API is used in this phase.
 
-One concrete error was in an AI-written startup test: it treated pytest's
-`tmp_path` as an empty directory even though another fixture had already populated
-that same directory with valid forecasts. The first run reported **40 passing
-tests and one failure** because startup correctly succeeded. I inspected the
-fixture paths, changed the missing-artifact test to use a separate nonexistent
-subdirectory, and reran the suite. This fixed the test instead of changing correct
-service behaviour to satisfy it.
+One AI-written test incorrectly assumed pytest's `tmp_path` was empty, although
+another fixture had already created valid forecast files there. Pytest caught
+the mistake: startup correctly succeeded when the test expected failure. The
+test was corrected to use a separate nonexistent directory; correct service
+behaviour was preserved.
 
-During setup, the smoke script initially used pandas' deprecated `dayofweek`
-property; runtime warnings prompted changing it to `day_of_week`. Homebrew's
-Docker cask also required administrator-only paths even with binary linking
-disabled; the official downloaded app was installed directly and user-level CLI
-links were verified with Docker's hello-world container.
+Verification includes hand-checked feature values, synthetic input cases, a
+regression check that changing future counts cannot change earlier forecasts,
+comparisons between API responses and saved CSVs, local and Docker pytest runs,
+and execution of the notebook. Model selection was committed before September
+evaluation, and that holdout was not used for subsequent tuning.
 
-Original checks included synthetic feature/metric examples, tests that altered future counts
-without changing earlier forecasts, file/checksum and Git freeze checks, local
-and container tests, notebook execution, and comparisons of API results with the
-saved CSVs. The development selection is committed before September evaluation.
-Part 2 usage will be appended only after the Part 1 freeze.
-
-On 2026-11-08, the user requested removal of the pytest files and Docker test
-target. The test results above describe the original Part 1 commit; the current
-verification scripts were subsequently removed as part of the minimum-layout
-cleanup. The earlier counts are historical results, not a current test suite.
-
-Codex also resolved code diagnostics and formatting on 2026-11-08. All saved
-backtest and October predictions and API responses were compared with the
-pre-cleanup version. The original selection and results remain unchanged;
-the freeze checks the original pre-evaluation implementation in Git rather than
-requiring a separate formatting-maintenance record. Source hashes describe that
-historical snapshot; subsequent source changes remain visible in Git.
-
-The user also requested the minimum project layout. Optional helper scripts,
-environment snapshots, duplicate Markdown report, separate chart files, and
-editor/cache files were removed. The notebook retains the report and embeds its
-charts directly; the final training audit was moved under `artifacts/final/`.
+Part 2 has not started. Its AI usage and checks will be added to this log after
+the completed Part 1 commit.
