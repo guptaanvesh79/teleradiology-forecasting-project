@@ -259,6 +259,39 @@ The main `llm_forecasting/` flow now predicts two daily point totals per call,
 then allocates each total to 24 hours in Python. Its only output directory is
 `artifacts/llm/`, and its October export is `llm_forecast.csv`.
 
+### What Qwen predicts and what Python calculates
+
+| Component | Responsibility |
+|---|---|
+| Qwen | Returns one daily point total per requested date, normally two dates per call, using only pre-origin summaries and the known future calendar. |
+| Python hourly allocation | Calculates 24 historical volume proportions for each weekday and multiplies each predicted daily total by that weekday's proportions. |
+| Python hourly uncertainty | Uses errors from three prior seven-day hybrid forecasts to calculate empirical residual p10/p90 offsets grouped by clock hour. |
+| Python daily uncertainty | Calculates residual p10/p90 offsets from the 21 complete daily errors, separately from the hourly bounds. |
+
+For weekday `w` and hour `h`, the allocation is:
+
+```text
+weight[w,h] = historical volume at weekday w, hour h / historical volume at weekday w
+hourly_forecast[date,h] = Qwen_daily_total[date] * weight[weekday(date),h]
+```
+
+Each weekday's 24 weights sum to one, so the hourly points sum to Qwen's daily
+total. Historical proportions and calibration forecasts use only information
+available before their respective origins. The fallback rules for zero-volume
+history are described below.
+
+Hourly and daily bounds add their respective residual percentiles to the point,
+keep lower bounds nonnegative and expand bounds when needed to contain the
+point. Hourly calibration captures both daily-volume and hourly allocation
+errors; daily calibration captures errors in the total daily volume.
+These are empirical uncertainty estimates, not Qwen-generated quantiles;
+`forecast` in the CSV is an allocated point, not a directly predicted hourly p50.
+Daily intervals are calculated independently, never by summing hourly p10/p90.
+
+Run `report.ipynb` with the repository root as the notebook working directory.
+Both report sections resolve their artifact paths from that directory, so the
+notebook can run from another clone without editing a personal filesystem path.
+
 **Assignment limitation:** L1 asks an LLM to generate hourly p10/p50/p90 directly.
 This chosen hybrid instead generates daily totals and uses Python for hourly
 allocation and empirical ranges, so it does not strictly satisfy that direct

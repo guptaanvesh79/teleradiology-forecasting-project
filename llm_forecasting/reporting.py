@@ -192,13 +192,14 @@ This is a hybrid deviation from L1: the LLM predicts daily totals rather than di
 10th/50th/90th quantiles. The previous direct experiment and its evidence were deleted at
 user request after selecting this approach; they are not presented as retained results.
 """),
-        code(f"""from pathlib import Path
+        code("""from pathlib import Path
+from io import BytesIO
 import json
 import pandas as pd
 import matplotlib.pyplot as plt
-from IPython.display import display
+from IPython.display import Image, display
 from llm_forecasting.reporting import saved_report_data
-HYBRID_ROOT = Path({str(root)!r})
+HYBRID_ROOT = Path.cwd().resolve()
 hybrid_report = saved_report_data(HYBRID_ROOT)
 display(hybrid_report['comparison'])
 display(hybrid_report['diagnostics'])
@@ -216,7 +217,9 @@ ax.fill_between(daily.date, daily.p10, daily.p90, alpha=0.2, label='Separate emp
 ax.set(title='October hybrid daily volume', ylabel='Recorded studies', xlabel='Source-clock date')
 ax.legend()
 fig.autofmt_xdate()
-display(fig)
+chart_buffer = BytesIO()
+fig.savefig(chart_buffer, format='png', bbox_inches='tight')
+display(Image(data=chart_buffer.getvalue()))
 plt.close(fig)
 """),
     ]

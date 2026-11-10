@@ -167,7 +167,8 @@ never a future feature, label replacement, or missing-hour repair.
 There are no future actual lags, unknown holiday locations, or study-level
 attributes in the predictors. Predict the whole horizon directly.
 """),
-        code("""quality = json.loads((ROOT / "artifacts/development/data_quality.json").read_text())
+        code(
+            """quality = json.loads((ROOT / "artifacts/development/data_quality.json").read_text())
 display(pd.Series(quality, name="June–August diagnostics"))
 fig, ax = plt.subplots(figsize=(10, 3))
 profile = pd.Series(quality["arrivals_by_stored_hour"], dtype=float)
@@ -178,7 +179,8 @@ ax.set(
     xlabel="Stored hour (timezone unspecified)",
     ylabel="June–August studies",
 )
-show_chart(fig)"""),
+show_chart(fig)"""
+        ),
         markdown("""## Methods and evaluation protocol
 
 Seasonal naive repeats the final 168 observed hours. Histogram gradient boosting
@@ -312,8 +314,9 @@ in this notebook. The original 45-test run is historical; current verification
 is recorded in README.
 The selection, checksums, and pre-September commit are recorded under `artifacts/`.
 AI coding assistance and concrete corrections are disclosed in `AI_USE_LOG.md`.
-Part 2 runs separately after the completed Part 1 commit. When its manually
-generated results exist, the following sections report them without LLM calls.
+Part 1 was committed before Part 2. The Part 2 section below reads saved results
+for the LLM hybrid comparison and explanation demonstrations without LLM calls.
+It reports pending stages if those artifacts are incomplete.
 """),
     ]
     from llm_forecasting.reporting import notebook_cells
