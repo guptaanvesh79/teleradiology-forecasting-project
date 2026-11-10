@@ -59,6 +59,13 @@ class DailyResponse(BaseModel):
     data: list[DailyRow]
 
 
+class ExplanationResponse(BaseModel):
+    metadata: Metadata
+    explanation: str
+    source: Literal["llm", "template"]
+    model: str | None
+
+
 def load_artifacts(root):
     try:
         hourly_path = root / "forecast.csv"
@@ -97,7 +104,7 @@ def date_range(start_date, end_date):
     return pd.Timestamp(start), pd.Timestamp(end) + pd.Timedelta(days=1)
 
 
-def create_app(artifact_root=ROOT):
+def create_app(artifact_root=ROOT, *, llm_client=None):
     artifact_root = Path(artifact_root)
 
     @asynccontextmanager
@@ -147,6 +154,27 @@ def create_app(artifact_root=ROOT):
         return {
             "metadata": request.app.state.metadata,
             "data": selected.reset_index().to_dict("records"),
+        }
+
+    @app.get("/explain", response_model=ExplanationResponse)
+    def explain(
+        request: Request,
+        start_date: Annotated[Date | None, Query()] = None,
+        end_date: Annotated[Date | None, Query()] = None,
+    ):
+        from llm_forecasting.explain import explain_forecast
+
+        start, end = date_range(start_date, end_date)
+        hourly = request.app.state.hourly
+        daily = request.app.state.daily
+        result = explain_forecast(
+            hourly.loc[(hourly.index >= start) & (hourly.index < end)],
+            daily.loc[(daily.index >= start) & (daily.index < end)],
+            llm_client,
+        )
+        return {
+            "metadata": request.app.state.metadata,
+            **{key: result[key] for key in ("explanation", "source", "model")},
         }
 
     return app

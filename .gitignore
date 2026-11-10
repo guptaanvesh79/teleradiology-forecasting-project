@@ -7,3 +7,4 @@ __pycache__/
 .env
 .venv/
 main_env/
+artifacts/llm/.pipeline.lock

@@ -8,6 +8,13 @@ import pandas as pd
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def isolated_llm_environment(monkeypatch):
+    """Tests never inherit a user's real provider configuration or API key."""
+    for name in ("LLM_PROVIDER", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def study_frame():
     return pd.DataFrame(

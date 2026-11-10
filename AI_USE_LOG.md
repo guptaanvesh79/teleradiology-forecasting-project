@@ -1,4 +1,4 @@
-# AI-use log — Part 1
+# AI-use log
 
 I used ChatGPT/Codex to help plan the approach, explain calendar features, and
 draft data preparation, forecasting, API, Docker, tests, and report code. All
@@ -17,5 +17,13 @@ comparisons between API responses and saved CSVs, local and Docker pytest runs,
 and execution of the notebook. Model selection was committed before September
 evaluation, and that holdout was not used for subsequent tuning.
 
-Part 2 has not started. Its AI usage and checks will be added to this log after
-the completed Part 1 commit.
+For Part 2, AI helped implement schemas, backtests, retries and explanations.
+Installation exposed Homebrew's missing MLX grammar library, resolved with
+Q4_K_M. A timestamp failure led to Python-generated dates.
+Pytest caught a numeric checker misreading date punctuation. Live development
+exposed a stale 4,096-token input limit rejecting a 5,518-token prompt; the guard
+now uses the configured budget. Positional replies also crossed quantiles.
+At my request, positional responses and archives were deleted for a fresh
+hr1–hr24 trial. Per-hour retries preserve accepted values without replacing them.
+Experiments and the combined notebook remain pending
+manual execution. No paid calls were made.

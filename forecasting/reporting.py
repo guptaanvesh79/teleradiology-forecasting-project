@@ -312,9 +312,13 @@ in this notebook. The original 45-test run is historical; current verification
 is recorded in README.
 The selection, checksums, and pre-September commit are recorded under `artifacts/`.
 AI coding assistance and concrete corrections are disclosed in `AI_USE_LOG.md`.
-Part 2 is not included and will start only after committing completed Part 1.
+Part 2 runs separately after the completed Part 1 commit. When its manually
+generated results exist, the following sections report them without LLM calls.
 """),
     ]
+    from llm_forecasting.reporting import notebook_cells
+
+    cells.extend(notebook_cells(root))
     notebook = nbformat.v4.new_notebook(
         cells=cells,
         metadata={
