@@ -69,10 +69,32 @@ def render(text, facts):
     return PLACEHOLDER.sub(lambda match: facts[match[1]], text)
 
 
+def bind_template_facts(sentence, facts):
+    """Recognize literal figures only in their exact, known template roles."""
+    for fragment in TEMPLATE.split(". "):
+        template = fragment if fragment.endswith(".") else fragment + "."
+        parts, previous = [], 0
+        for match in PLACEHOLDER.finditer(template):
+            parts.append(re.escape(template[previous : match.start()]))
+            # A total cannot be accepted merely because it appears elsewhere
+            # in facts: this slot must match this particular named fact.
+            parts.append(
+                "(?:" + re.escape(match[0]) + "|" + re.escape(facts[match[1]]) + ")"
+            )
+            previous = match.end()
+        parts.append(re.escape(template[previous:]))
+        if re.fullmatch("".join(parts), sentence.strip(), flags=re.I):
+            return template
+    return sentence
+
+
 def validate_explanation(text, facts):
     response = Sentences.model_validate(strict_json(text))
+    sentences = [
+        bind_template_facts(sentence, facts) for sentence in response.sentences
+    ]
     used = set()
-    for sentence in response.sentences:
+    for sentence in sentences:
         placeholders = PLACEHOLDER.findall(sentence)
         if not set(placeholders) <= facts.keys():
             raise ValueError("Unknown explanation fact")
@@ -97,7 +119,7 @@ def validate_explanation(text, facts):
         used.update(placeholders)
     if not REQUIRED_FACTS <= used:
         raise ValueError("Explanation omitted required workload or uncertainty facts")
-    original = " ".join(sentence.strip() for sentence in response.sentences)
+    original = " ".join(sentence.strip() for sentence in sentences)
     result = render(original, facts)
     # Every rendered numeric span must originate in one of the supplied values.
     number_pattern = r"\d+(?:,\d{3})*(?:\.\d+)?"
@@ -115,7 +137,7 @@ def explanation_messages(facts):
     return [
         {
             "role": "system",
-            "content": "Write two or three short plain-language forecast sentences as a JSON sentences list. Use ONLY the supplied facts. Copy fact placeholders exactly, for example {{period_total}}. Never write literal numbers, number words, percentages, causes, staffing advice or confidence claims. Include period_total, busiest_period with busiest_period_total, and busiest_day with daily_low then daily_high in the same range sentence. Each list item must be exactly one sentence ending with a period. Busiest periods are source-calendar seven-day blocks, possibly partial at the edges. Daily ranges are separately calibrated Part 1 ranges, not sums of hourly bounds. The timezone is unspecified.",
+            "content": "Write two or three short plain-language forecast sentences as a JSON sentences list. Use ONLY the supplied facts. Prefer copying fact placeholders exactly, for example {{period_total}}. If writing literal figures, copy example_structure exactly and substitute each placeholder only with its corresponding verified value. Literal figures in other wording are rejected. Never add number words, percentages, causes, staffing advice or confidence claims. Include period_total, busiest_period with busiest_period_total, and busiest_day with daily_low then daily_high in the same range sentence. Each list item must be exactly one sentence ending with a period. Busiest periods are source-calendar seven-day blocks, possibly partial at the edges. Daily ranges are separately calibrated Part 1 ranges, not sums of hourly bounds. The timezone is unspecified.",
         },
         {
             "role": "user",
@@ -185,7 +207,12 @@ def explain_demo(root=None, client=None):
         },
     )
     if live["source"] != "llm":
+        failures = [
+            record["error"] for record in live["records"] if record.get("error")
+        ]
+        detail = f". Last failure: {failures[-1]}" if failures else ""
         raise ValueError(
             "Saved fallback evidence, but a genuine validated LLM explanation is still required"
+            + detail
         )
     print("Saved a genuine LLM explanation and a labelled simulated-failure fallback.")

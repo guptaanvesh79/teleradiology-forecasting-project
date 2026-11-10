@@ -71,6 +71,90 @@ def test_explanation_facts_match_part1_daily_ranges(artifact_root):
     assert "{{" not in text
 
 
+@pytest.mark.parametrize("mode", ["literal", "mixed"])
+def test_correct_literal_figures_in_template_roles_are_accepted(artifact_root, mode):
+    hourly, daily, _ = load_artifacts(artifact_root)
+    facts = explanation_facts(hourly, daily)
+    value = valid_reply()
+    if mode == "literal":
+        value["sentences"] = [
+            render(sentence, facts) for sentence in value["sentences"]
+        ]
+    else:
+        value["sentences"][0] = render(value["sentences"][0], facts)
+        value["sentences"][2] = value["sentences"][2].replace(
+            "{{daily_low}}", facts["daily_low"]
+        )
+    assert validate_explanation(json.dumps(value), facts) == render(TEMPLATE, facts)
+    provider, calls = client_with_response(value)
+    with TestClient(create_app(artifact_root, llm_client=provider)) as api:
+        response = api.get("/explain")
+        assert response.json()["source"] == "llm"
+        assert response.json()["explanation"] == render(TEMPLATE, facts)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "wrong_total",
+        "swapped_totals",
+        "wrong_date",
+        "swapped_dates",
+        "reversed_range",
+        "wrong_daily_point",
+        "wrong_bound",
+        "extra_number",
+        "extra_claim",
+        "altered_context",
+    ],
+)
+def test_literal_figures_must_match_their_specific_fact_roles(artifact_root, problem):
+    hourly, daily, _ = load_artifacts(artifact_root)
+    facts = explanation_facts(hourly, daily)
+    value = valid_reply()
+    if problem == "wrong_total":
+        value["sentences"][0] = value["sentences"][0].replace(
+            "{{period_total}}", "999,999.0"
+        )
+    elif problem == "swapped_totals":
+        value["sentences"][0] = value["sentences"][0].replace(
+            "{{period_total}}", facts["busiest_period_total"]
+        )
+    elif problem == "wrong_date":
+        value["sentences"][0] = value["sentences"][0].replace(
+            "{{start_date}}", "2026-09-30"
+        )
+    elif problem == "swapped_dates":
+        value["sentences"][0] = value["sentences"][0].replace(
+            "{{start_date}}", facts["end_date"]
+        )
+    elif problem == "reversed_range":
+        value["sentences"][2] = (
+            value["sentences"][2]
+            .replace("{{daily_low}}", facts["daily_high"])
+            .replace("{{daily_high}}", facts["daily_low"])
+        )
+    elif problem == "wrong_daily_point":
+        value["sentences"][2] = value["sentences"][2].replace(
+            "{{daily_point}}", facts["period_total"]
+        )
+    elif problem == "wrong_bound":
+        value["sentences"][2] = value["sentences"][2].replace(
+            "{{daily_low}}", "999,999.0"
+        )
+    elif problem == "extra_number":
+        value["sentences"][0] = value["sentences"][0][:-1] + " over 31 days."
+    elif problem == "extra_claim":
+        value["sentences"][0] += " Another 31 studies."
+    else:
+        # Reusing a correct number in a new claim does not verify its meaning.
+        value["sentences"][0] = f"Staffing capacity is {facts['period_total']} studies."
+    value["sentences"] = [render(sentence, facts) for sentence in value["sentences"]]
+    with pytest.raises(ValueError):
+        validate_explanation(json.dumps(value), facts)
+
+
 @pytest.mark.parametrize(
     "problem",
     [

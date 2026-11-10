@@ -269,19 +269,23 @@ report does not depend on or present those removed results.
 Hybrid development was retained unchanged during promotion: mean hourly WAPE
 **19.56%**, versus Part 1's **19.95%**, across the same three development windows.
 September outcomes had already been inspected when this hybrid was designed;
-its forthcoming September evaluation is explicitly **exploratory**, not a fresh
-untouched holdout. Improvement on development does not guarantee improvement on
-September or October.
+its completed September evaluation is explicitly **exploratory**, not a fresh
+untouched holdout. Across three runs, mean September hourly WAPE is **15.03%**
+and daily-total WAPE is **12.52%**. Mean hourly interval coverage is **76.39%**;
+daily coverage is only **56.67%**, a limitation rather than an 80% guarantee.
+October forecasts are generated, but October actuals are unavailable.
 
-### Manual sequence
+### Execution sequence (completed)
 
-The successful daily-volume development results are already in the main output
-folder. `develop` verifies and preserves them without model calls. Commit the
-promoted code, protocol, journal and results before the new September runs:
+The promoted code, protocol and development evidence were committed before the
+hybrid September evaluation. All three September runs, October forecasting,
+the live/fallback explanation demonstrations and the combined report are now
+complete. The commands below document the workflow; development is frozen in
+this checkout after September evaluation.
 
 ```bash
 conda activate main_env
-# Optional: verifies the retained complete development stage; no new inference.
+# Development step, before September; now frozen in the completed checkout.
 python -m llm_forecasting develop
 
 git add -A llm_forecasting tests artifacts/llm Dockerfile .gitignore README.md AI_USE_LOG.md
@@ -293,7 +297,7 @@ python -m llm_forecasting explain-demo
 python -m llm_forecasting report
 ```
 
-These experiment stages, notebook regeneration and commits remain manual.
+The experiment stages and notebook regeneration were executed manually.
 `evaluate-final` runs three independent September forecasts and freezes
 further development at its first attempt. `forecast` produces October without
 selecting a best September run. Completed stages are verified and preserved.
@@ -301,7 +305,16 @@ selecting a best September run. Completed stages are verified and preserved.
 simulated-outage fallback. `report` reads saved results only, compares all Part 1
 methods with the hybrid, displays measured forecast errors and explanations,
 and appends/replaces its tagged notebook cells while preserving existing charts.
-Part 1's notebook generator can also include these sections when all results exist.
+The combined notebook includes these sections and the original Part 1 charts.
+Part 1's notebook generator can also include the completed Part 2 sections.
+
+Explanation replies may use named placeholders or literal figures in the supplied
+template. Literal totals, dates and bounds must match their specific template
+fields exactly; merely appearing elsewhere in the verified facts is insufficient.
+Other wording must use placeholders. Unknown or extra numeric claims, changed
+figures and reversed ranges still trigger retries and the template fallback.
+The demo reports the last failure if every attempt is rejected; rerunning it
+after an explanation-only fix does not regenerate any forecasting results.
 
 ### Inputs, response and allocation
 
@@ -387,12 +400,19 @@ Part 1 artifacts, validates its numbers and falls back when Ollama is unavailabl
 
 ## Current implementation verification
 
-- Local and Linux Docker suites: **153 passed**, including promotion-prefix,
-  partial-date recovery, provider, API and full 187-batch workflow tests.
-- Temporary mocked report: three executed code cells, one embedded chart and
-  no errors; existing notebook cells/outputs preserved.
-- All 69 protected Part 1, input-data and submitted-notebook files are unchanged.
-- The retained hybrid journal and 14 development files are unchanged; old direct
+- Local and Linux Docker suites: **165 passed**, including verified literal
+  explanation figures, promotion-prefix, partial-date recovery, provider, API
+  and full 187-batch workflow tests.
+- Both submitted forecast CSVs validate with exactly **744 October hours**.
+- All three hybrid September runs and the October forecast have complete,
+  verified manifests; comparison and allocation-diagnostic CSVs are saved.
+- The live explanation is validated with source `llm`; the simulated-outage
+  demonstration returns source `template` using the same verified Part 1 facts.
+- The combined `report.ipynb` has **eight executed code cells, five embedded
+  charts and no execution errors**. Original Part 1 cells and charts are retained.
+- Part 1 models, input data, selection and forecast results are preserved.
+- The original hybrid development journal prefix and 14 development files were
+  preserved; later manual runs appended their request evidence. Old direct
   results and duplicate experimental folders were removed as requested.
-- No live model calls, new forecasts, project commits or submitted-notebook
-  regeneration occurred during consolidation. Docker was stopped after tests.
+- Implementation checks used mocks; real experiment stages and report execution
+  were performed manually afterward. Docker was stopped after container tests.
