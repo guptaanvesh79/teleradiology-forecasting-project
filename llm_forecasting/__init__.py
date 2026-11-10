@@ -1,1 +1,1 @@
-"""Separate, manually executed LLM experiments; Part 1 remains the benchmark."""
+"""Daily LLM volume forecasts with historical hourly allocation and validated explanations."""

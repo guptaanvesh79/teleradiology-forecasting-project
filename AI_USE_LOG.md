@@ -1,21 +1,15 @@
 # AI-use log
 
-I used ChatGPT/Codex to help plan the approach, explain calendar features, and
-draft data preparation, forecasting, API, Docker, tests, and report code. All
-Part 1 forecast numbers are computed locally by classical algorithms. No history
-was sent to an LLM to obtain forecasts, and no LLM API is used in this phase.
+ChatGPT/Codex helped plan calendar features, data preparation, forecasting, API,
+Docker, tests and reporting. Classical algorithms produce Part 1's numbers.
 
-One AI-written test incorrectly assumed pytest's `tmp_path` was empty, although
-another fixture had already created valid forecast files there. Pytest caught
-the mistake: startup correctly succeeded when the test expected failure. The
-test was corrected to use a separate nonexistent directory; correct service
-behaviour was preserved.
+An AI-written test assumed pytest's `tmp_path` was empty despite existing fixture
+files. Pytest caught the mistaken startup-failure expectation. The fixture was
+corrected to use a separate nonexistent directory, preserving service behaviour.
 
-Verification includes hand-checked feature values, synthetic input cases, a
-regression check that changing future counts cannot change earlier forecasts,
-comparisons between API responses and saved CSVs, local and Docker pytest runs,
-and execution of the notebook. Model selection was committed before September
-evaluation, and that holdout was not used for subsequent tuning.
+Verification includes hand-checked features, synthetic inputs, future-count
+leakage checks, API/artifact comparisons, local and Docker pytest, and notebook
+execution. Part 1 selection was committed before September evaluation.
 
 For Part 2, AI helped implement schemas, backtests, retries and explanations.
 Installation exposed Homebrew's missing MLX grammar library, resolved with
@@ -25,5 +19,13 @@ exposed a stale 4,096-token input limit rejecting a 5,518-token prompt; the guar
 now uses the configured budget. Positional replies also crossed quantiles.
 At my request, positional responses and archives were deleted for a fresh
 hr1–hr24 trial. Per-hour retries preserve accepted values without replacing them.
-Experiments and the combined notebook remain pending
-manual execution. No paid calls were made.
+The direct development and three September runs were then executed manually.
+
+AI helped build daily-volume/hourly-allocation forecasting and rolling calibration.
+Pytest corrected a retry-count expectation that ignored one-day calibration tails.
+After development, I requested promotion into the main LLM package and deletion
+of the direct trial and temporary folders. Its daily development CSVs and raw
+journal were retained unchanged with migration provenance. This is an exploratory
+hybrid, differing from L1's direct hourly-quantile requirement. Further experiments,
+notebook regeneration and commits remain manual. Part 1 is preserved; no paid
+calls were made.

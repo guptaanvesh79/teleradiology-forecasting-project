@@ -1,75 +1,13 @@
-"""Origin-safe summaries and strict numeric forecast contracts."""
+"""Origin-safe daily contracts, seasonal proportions and empirical ranges."""
 
 import json
-from dataclasses import dataclass
 import math
-from typing import Annotated, Any
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from forecasting.artifacts import validate_bounds
 from forecasting.data import day_audit
-
-CHUNK_HOURS = 12
-COHERENCE_TOLERANCE = 1e-6
-HOUR_LABEL_MAPPING = {f"hr{hour + 1}": hour for hour in range(24)}
-SCHEMA_POLICY = {
-    "exact_requested_hour_keys": True,
-    "all_keys_required": True,
-    "additional_keys_allowed": False,
-    "key_order_significant": False,
-    "retain_valid_hours": True,
-    "retry_only_remaining_hours": True,
-    "missing_keys_are_partial": True,
-}
-
-SYSTEM_PROMPT = """You forecast recorded teleradiology study arrivals from synthetic history.
-Use ONLY the supplied pre-origin summaries and requested future calendar.
-Recorded zero counts do not prove zero underlying demand; sparse days are not proven outages.
-Do not invent holidays, timezones, staffing, hospitals or future observations.
-Predict every requested hour directly. Do not extrapolate from actual counts inside the horizon.
-Return only JSON matching the schema: chunk_total and an hours object with the requested keys.
-An initial request contains 12 keys; a retry may contain fewer. Return predictions ONLY for
-response_hour_keys, even when the calendar gives other hours as context.
-Copy ONLY the supplied response_hour_keys into hours. hr1 means 00:00, hr12 means 11:00,
-hr13 means 12:00, and hr24 means 23:00. Do not restart numbering in the afternoon.
-Use the requested date and weekday to choose historical patterns. JSON key order does not matter.
-Each hourly array is [p10,p50,p90]: finite nonnegative numbers, with p10 <= p50 <= p90.
-chunk_total is your stated sum of p50 values for ONLY the hours requested in this call.
-Do not output timestamps or additional fields.
-Hourly quantiles are marginal; their sums are not daily quantiles."""
-
-Number = Annotated[float, Field(ge=0, allow_inf_nan=False)]
-Triple = Annotated[list[Number], Field(min_length=3, max_length=3)]
-
-
-class ForecastReply(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
-    chunk_total: Number
-    hours: Annotated[dict[str, Triple], Field(min_length=1, max_length=CHUNK_HOURS)]
-
-    @model_validator(mode="after")
-    def ordered_quantiles(self):
-        if any(not low <= middle <= high for low, middle, high in self.hours.values()):
-            raise ValueError("Require p10 <= p50 <= p90 for every hour")
-        return self
-
-
-class ForecastEnvelope(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
-    chunk_total: Number
-    hours: Annotated[dict[str, Any], Field(max_length=CHUNK_HOURS)]
-
-
-@dataclass
-class RecoveredForecast:
-    hours: dict[str, list[float]]
-    chunk_total: float | None
-
-
-TRIPLE_VALIDATOR = TypeAdapter(Triple)
 
 
 def strict_json(text):
@@ -87,196 +25,133 @@ def strict_json(text):
     return json.loads(text, parse_constant=constant, object_pairs_hook=unique)
 
 
-def response_schema_template():
-    return ForecastReply.model_json_schema()
+BATCH_DAYS = 2
+TOLERANCE = 1e-6
+SYSTEM_PROMPT = """Forecast daily recorded teleradiology study arrivals from synthetic history.
+Use ONLY the supplied pre-origin daily summaries and requested dates and weekdays.
+Recorded zeros and sparse days are not proven outages. Do not invent holidays,
+timezones, hospitals, staffing or future observations. Predict each requested daily
+point total directly; Python will allocate it to hours separately.
+Return ONLY strict JSON: {"days":{"requested-date":nonnegative-number}}.
+Use exactly response_dates as keys, without extra fields. An initial request has
+up to two dates; retries may request only one. Copy dates exactly. Do not return
+hourly predictions, quantiles, explanations or a combined total."""
+ALLOCATION_POLICY = {
+    "history": "all recorded pre-origin observations; no sparse-day exclusion",
+    "proportion": "weekday/hour volume divided by total volume of that weekday",
+    "fallback": ["overall hour-of-day proportions", "uniform 1/24"],
+    "point": "daily LLM point total times historical hourly proportion; not an hourly median",
+}
+CALIBRATION_POLICY = {
+    "origin_offsets_days": [21, 14, 7],
+    "window_days": 7,
+    "hourly_residual_groups": "clock hour, 21 observations each",
+    "daily_residuals": "21 whole-day errors, independent of hourly bounds",
+    "percentiles": [0.1, 0.9],
+    "bounds": "nonnegative and containing the point; empirical, no coverage guarantee",
+}
 
 
-def forecast_hour_keys(hours):
+def history_before(series, origin):
+    origin = pd.Timestamp(origin)
+    if origin.tz is not None or pd.isna(origin) or origin != origin.normalize():
+        raise ValueError("Origin must be a valid timezone-naive midnight")
+    if not isinstance(series.index, pd.DatetimeIndex) or series.index.tz is not None:
+        raise ValueError("History must use timezone-naive hourly timestamps")
+    history = series.loc[series.index < origin].copy()
     if (
-        not isinstance(hours, pd.DatetimeIndex)
-        or hours.tz is not None
-        or not 1 <= len(hours) <= CHUNK_HOURS
-        or hours.hasnans
-        or not hours.is_unique
-        or not hours.is_monotonic_increasing
-        or not hours.equals(hours.floor("h"))
-        or hours[0].normalize() != hours[-1].normalize()
-        or hours[0].hour // CHUNK_HOURS != hours[-1].hour // CHUNK_HOURS
-    ):
-        raise ValueError(
-            "Require one to twelve distinct ordered hours within one half-day"
+        len(history) < 14 * 24
+        or not history.index.equals(
+            pd.date_range(history.index[0], origin, freq="h", inclusive="left")
         )
-    return [f"hr{hour + 1}" for hour in hours.hour]
-
-
-def forecast_schema(hours):
-    keys = forecast_hour_keys(hours)
-    schema = response_schema_template()
-    triple = schema["properties"]["hours"]["additionalProperties"]
-    schema["properties"]["hours"] = {
-        "type": "object",
-        "properties": {key: triple for key in keys},
-        "required": keys,
-        "additionalProperties": False,
-    }
-    return schema
-
-
-def prediction_values(reply, hours):
-    keys = forecast_hour_keys(hours)
-    if set(reply.hours) != set(keys):
-        raise ValueError(f"Require exactly the requested hour keys: {', '.join(keys)}")
-    return [reply.hours[key] for key in keys]
-
-
-def parse_forecast(text, hours):
-    reply = ForecastReply.model_validate(strict_json(text))
-    prediction_values(reply, hours)
-    return reply
-
-
-def inspect_forecast(text, hours):
-    """Validate independent hours without repairing or losing valid neighbours."""
-    keys = forecast_hour_keys(hours)
-    envelope = ForecastEnvelope.model_validate(strict_json(text))
-    if set(envelope.hours) - set(keys):
-        raise ValueError("Response contains unrequested hour keys")
-    accepted, failures, medians = {}, {}, {}
-    for key in keys:
-        if key not in envelope.hours:
-            failures[key] = "Missing hour"
-            continue
-        try:
-            triple = TRIPLE_VALIDATOR.validate_python(envelope.hours[key], strict=True)
-            medians[key] = triple[1]
-            if not triple[0] <= triple[1] <= triple[2]:
-                raise ValueError("Require p10 <= p50 <= p90")
-        except ValueError as error:
-            failures[key] = str(error)
-        else:
-            accepted[key] = triple
-    total = sum(medians.values()) if len(medians) == len(keys) else None
-    if total is not None and not math.isfinite(total):
-        total = None
-    discrepancy = envelope.chunk_total - total if total is not None else None
-    return {
-        "requested_hour_keys": keys,
-        "accepted_hours": accepted,
-        "failed_hours": failures,
-        "stated_total": envelope.chunk_total,
-        "hourly_p50_total": total,
-        "coherence_error": discrepancy,
-        "coherent": (
-            abs(discrepancy) <= COHERENCE_TOLERANCE if discrepancy is not None else None
-        ),
-    }
+        or history.index[0] != history.index[0].normalize()
+    ):
+        raise ValueError("Require at least fourteen complete pre-origin days")
+    values = history.to_numpy(dtype=float)
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError("History must be finite and nonnegative")
+    return history
 
 
 def history_summary(series, origin):
-    origin = pd.Timestamp(origin)
-    if origin.tz is not None or origin != origin.normalize():
-        raise ValueError("Origin must be a timezone-naive midnight")
-    if not isinstance(series.index, pd.DatetimeIndex) or series.index.tz is not None:
-        raise ValueError("History must have timezone-naive hourly timestamps")
-    history = series.loc[series.index < origin].copy()
-    if len(history) < 168:
-        raise ValueError("Require at least seven complete pre-origin days")
-    expected = pd.date_range(history.index[0], origin, freq="h", inclusive="left")
-    if history.index[0] != history.index[0].normalize() or not history.index.equals(
-        expected
-    ):
-        raise ValueError(
-            "History must be complete, ordered hours ending before the origin"
-        )
-    values = history.to_numpy(dtype=float)
-    if not np.isfinite(values).all() or (values < 0).any():
-        raise ValueError("Historical counts must be finite and nonnegative")
-    table = history.to_frame("count")
-    table["weekday"] = table.index.day_of_week
-    table["hour"] = table.index.hour
-    profiles = []
-    for (weekday, hour), group in table.groupby(["weekday", "hour"]):
-        counts = group["count"]
-        profiles.append(
-            [
-                int(weekday),
-                int(hour),
-                round(float(counts.mean()), 2),
-                round(float(counts.median()), 2),
-                round(float(counts.quantile(0.1)), 2),
-                round(float(counts.quantile(0.9)), 2),
-                len(counts),
-            ]
-        )
+    history = history_before(series, origin)
     daily = history.resample("D").sum()
-    weekday_totals = [
-        [int(weekday), round(float(counts.mean()), 2), round(float(counts.median()), 2)]
-        for weekday, counts in daily.groupby(daily.index.day_of_week)
-    ]
+    profiles = []
+    for weekday, counts in daily.groupby(daily.index.day_of_week):
+        profiles.append(
+            {
+                "weekday": int(weekday),
+                "mean": float(counts.mean()),
+                "median": float(counts.median()),
+                "p10": float(counts.quantile(0.1)),
+                "p90": float(counts.quantile(0.9)),
+                "n": len(counts),
+            }
+        )
     audit = day_audit(history)
     return {
         "history_start": str(history.index[0]),
         "history_end": str(history.index[-1]),
         "timezone": "unspecified",
         "weekday_definition": "Monday=0, Sunday=6",
-        "profile_columns": ["weekday", "hour", "mean", "median", "p10", "p90", "n"],
-        "weekday_hour_profiles": profiles,
-        "recent_28_daily_totals": [
-            [str(day.date()), float(total)] for day, total in daily.tail(28).items()
-        ],
-        "daily_weekday_columns": ["weekday", "mean", "median"],
-        "daily_totals_by_weekday": weekday_totals,
-        "empty_hours": int(history.eq(0).sum()),
+        "recent_28_daily_totals": {
+            str(day.date()): float(total) for day, total in daily.tail(28).items()
+        },
+        "weekday_daily_profiles": profiles,
         "empty_days": int(daily.eq(0).sum()),
-        "sparse_day_rule": "below 10% of the historical weekday median; diagnostic only",
-        "sparse_days": [
-            [str(day.date()), float(row.recorded_total)]
+        "sparse_day_rule": "below 10% of positive historical weekday median; diagnostic only",
+        "sparse_days": {
+            str(day.date()): float(row.recorded_total)
             for day, row in audit.loc[audit.near_empty].iterrows()
-        ],
+        },
         "unusual_days_removed": False,
     }
 
 
-def forecast_chunks(origin, days):
-    origin = pd.Timestamp(origin)
+def date_keys(dates):
+    dates = pd.DatetimeIndex(dates)
     if (
-        origin.tz is not None
-        or origin != origin.normalize()
-        or isinstance(days, bool)
-        or not isinstance(days, int)
-        or days <= 0
+        not 1 <= len(dates) <= BATCH_DAYS
+        or dates.tz is not None
+        or dates.hasnans
+        or not dates.is_unique
+        or not dates.is_monotonic_increasing
+        or not dates.equals(dates.normalize())
     ):
-        raise ValueError("Require a timezone-naive midnight and positive day count")
-    for offset in range(0, days * 24, CHUNK_HOURS):
-        start = origin + pd.Timedelta(hours=offset)
-        yield pd.date_range(start, periods=CHUNK_HOURS, freq="h", name="hour_start")
+        raise ValueError("Require one or two unique ordered timezone-naive dates")
+    return [str(day.date()) for day in dates]
 
 
-def validate_chunk_index(hours):
-    if (
-        not isinstance(hours, pd.DatetimeIndex)
-        or hours.tz is not None
-        or len(hours) != CHUNK_HOURS
-        or hours[0].hour not in (0, 12)
-        or hours[0] != hours[0].floor("h")
-        or not hours.equals(pd.date_range(hours[0], periods=CHUNK_HOURS, freq="h"))
-    ):
-        raise ValueError(
-            "Require exactly 12 consecutive naive hours starting at midnight or noon"
-        )
+def batches(origin, days):
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        raise ValueError("Forecast days must be a positive integer")
+    index = pd.date_range(origin, periods=days, freq="D")
+    date_keys(index[:1])
+    for offset in range(0, days, BATCH_DAYS):
+        yield index[offset : offset + BATCH_DAYS]
 
 
-def forecast_messages(summary, hours, requested_hours=None):
-    validate_chunk_index(hours)
-    requested_hours = hours if requested_hours is None else requested_hours
-    keys = forecast_hour_keys(requested_hours)
-    if not set(requested_hours) <= set(hours):
-        raise ValueError("Requested retry hours must belong to the original chunk")
-    calendar = {
-        "date": str(hours[0].date()),
-        "weekday": int(hours[0].day_of_week),
-        "hours": hours.hour.tolist(),
+def response_schema(dates):
+    return {
+        "type": "object",
+        "properties": {
+            "days": {
+                "type": "object",
+                "properties": {
+                    key: {"type": "number", "minimum": 0} for key in date_keys(dates)
+                },
+                "required": date_keys(dates),
+                "additionalProperties": False,
+            }
+        },
+        "required": ["days"],
+        "additionalProperties": False,
     }
+
+
+def messages(summary, full_dates, requested_dates):
+    if not set(requested_dates) <= set(full_dates):
+        raise ValueError("Retry dates must belong to the original batch")
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -284,65 +159,148 @@ def forecast_messages(summary, hours, requested_hours=None):
             "content": json.dumps(
                 {
                     "history": summary,
-                    "calendar": calendar,
-                    "response_hour_keys": keys,
+                    "calendar": [
+                        {"date": key, "weekday": int(day.day_of_week)}
+                        for key, day in zip(date_keys(full_dates), full_dates)
+                    ],
+                    "response_dates": date_keys(requested_dates),
                 },
-                separators=(",", ":"),
                 allow_nan=False,
+                separators=(",", ":"),
             ),
         },
     ]
 
 
-def frames_from_reply(reply, hours):
-    validate_chunk_index(hours)
-    hourly = pd.DataFrame(
-        prediction_values(reply, hours), columns=["p10", "forecast", "p90"], index=hours
-    )
-    hourly = hourly[["forecast", "p10", "p90"]]
-    validate_bounds(hourly)
-    chunks = pd.DataFrame(
-        {
-            "chunk_end_exclusive": [hours[-1] + pd.Timedelta(hours=1)],
-            "forecast": [float(hourly.forecast.sum())],
-            "stated_total": [
-                np.nan if reply.chunk_total is None else reply.chunk_total
-            ],
-        },
-        index=pd.DatetimeIndex([hours[0]], name="chunk_start"),
-    )
-    chunks["coherence_error"] = chunks.stated_total - chunks.forecast
-    chunks["coherent"] = (chunks.coherence_error.abs() <= COHERENCE_TOLERANCE).where(
-        chunks.coherence_error.notna()
-    )
-    return hourly, chunks
-
-
-def daily_from_chunks(hourly, chunks):
-    index = hourly.index
+def inspect_reply(text, dates):
+    keys = date_keys(dates)
+    value = strict_json(text)
     if (
-        index.empty
-        or index.tz is not None
-        or len(index) % 24
-        or index[0] != index[0].normalize()
-        or not index.equals(pd.date_range(index[0], periods=len(index), freq="h"))
-        or not chunks.index.equals(index[::CHUNK_HOURS])
-        or not pd.DatetimeIndex(chunks.chunk_end_exclusive).equals(
-            chunks.index + pd.Timedelta(hours=CHUNK_HOURS)
+        not isinstance(value, dict)
+        or set(value) != {"days"}
+        or not isinstance(value["days"], dict)
+    ):
+        raise ValueError("Require exactly one days object")
+    if set(value["days"]) - set(keys):
+        raise ValueError("Response contains an unrequested date")
+    accepted, failed = {}, {}
+    for key in keys:
+        number = value["days"].get(key)
+        try:
+            valid = (
+                type(number) in (int, float) and math.isfinite(number) and number >= 0
+            )
+        except OverflowError:
+            valid = False
+        if not valid:
+            failed[key] = "Require a finite nonnegative numeric daily total"
+        else:
+            accepted[key] = float(number)
+    return {"accepted_days": accepted, "failed_days": failed}
+
+
+def hourly_proportions(series, origin):
+    history = history_before(series, origin)
+    table = history.to_frame("count")
+    table["weekday"], table["hour"] = history.index.day_of_week, history.index.hour
+    overall = (
+        table.groupby("hour")["count"]
+        .sum()
+        .reindex(range(24), fill_value=0)
+        .to_numpy(dtype=float)
+    )
+    overall = overall / overall.sum() if overall.sum() > 0 else np.full(24, 1 / 24)
+    rows = []
+    for weekday in range(7):
+        counts = (
+            table.loc[table.weekday == weekday]
+            .groupby("hour")["count"]
+            .sum()
+            .reindex(range(24), fill_value=0)
+            .to_numpy(dtype=float)
         )
+        fallback = (
+            "weekday" if counts.sum() else ("overall" if history.sum() else "uniform")
+        )
+        weights = counts / counts.sum() if counts.sum() else overall.copy()
+        weights /= weights.sum()
+        rows.extend(
+            {
+                "weekday": weekday,
+                "hour": hour,
+                "proportion": float(weight),
+                "profile_source": fallback,
+            }
+            for hour, weight in enumerate(weights)
+        )
+    return pd.DataFrame(rows)
+
+
+def allocate(daily_totals, proportions):
+    dates = pd.DatetimeIndex(pd.to_datetime(list(daily_totals)))
+    if (
+        dates.empty
+        or dates.tz is not None
+        or not dates.equals(pd.date_range(dates[0], periods=len(dates), freq="D"))
     ):
         raise ValueError(
-            "Require complete ordered days with exactly two matching 12-hour chunks each"
+            "Daily predictions must be consecutive ordered naive midnights"
         )
-    expected_totals = hourly.forecast.resample(f"{CHUNK_HOURS}h").sum()
-    if not np.allclose(
-        chunks.forecast, expected_totals, atol=COHERENCE_TOLERANCE, rtol=0
+    if not dates.equals(dates.normalize()):
+        raise ValueError("Daily predictions must start at midnight")
+    lookup = proportions.pivot(
+        index="weekday", columns="hour", values="proportion"
+    ).reindex(index=range(7), columns=range(24))
+    values = lookup.to_numpy(dtype=float)
+    if (
+        not np.isfinite(values).all()
+        or (values < 0).any()
+        or not np.allclose(values.sum(axis=1), 1, atol=1e-12, rtol=0)
     ):
-        raise ValueError("Chunk point totals differ from hourly sums")
-    daily = hourly.forecast.resample("D").sum().to_frame().rename_axis("date")
-    daily["stated_total"] = chunks.stated_total.resample("D").sum(min_count=2)
-    daily["coherence_error"] = daily.stated_total - daily.forecast
-    daily["coherent"] = (daily.coherence_error.abs() <= COHERENCE_TOLERANCE).where(
-        daily.coherence_error.notna()
+        raise ValueError(
+            "Require normalized nonnegative complete weekday/hour proportions"
+        )
+    totals = np.array(list(daily_totals.values()), dtype=float)
+    if not np.isfinite(totals).all() or (totals < 0).any():
+        raise ValueError("Daily forecasts must be finite and nonnegative")
+    points = (totals[:, None] * values[dates.day_of_week]).ravel()
+    if not np.isfinite(points).all():
+        raise ValueError("Allocated forecasts overflowed")
+    hourly = pd.DataFrame(
+        {"forecast": points},
+        index=pd.date_range(dates[0], periods=len(points), freq="h", name="hour_start"),
     )
-    return daily
+    if not np.allclose(
+        hourly.forecast.resample("D").sum(), totals, atol=TOLERANCE, rtol=0
+    ):
+        raise ValueError("Allocated hours do not preserve daily totals")
+    return hourly
+
+
+def empirical_ranges(hourly, residuals):
+    if (
+        len(residuals) != 21 * 24
+        or residuals.index.tz is not None
+        or not residuals.index.equals(
+            pd.date_range(
+                hourly.index[0] - pd.Timedelta(days=21), periods=21 * 24, freq="h"
+            )
+        )
+        or residuals.index[-1] >= hourly.index[0]
+    ):
+        raise ValueError("Require 21 complete pre-origin days of calibration residuals")
+    if not np.isfinite(residuals).all():
+        raise ValueError("Calibration errors must be finite")
+    hourly = hourly.copy()
+    daily = hourly.forecast.resample("D").sum().to_frame().rename_axis("date")
+    groups = residuals.groupby(residuals.index.hour)
+    low = hourly.index.hour.map(groups.quantile(0.1)).to_numpy()
+    high = hourly.index.hour.map(groups.quantile(0.9)).to_numpy()
+    hourly["p10"] = np.maximum(0, hourly.forecast + np.minimum(0, low))
+    hourly["p90"] = hourly.forecast + np.maximum(0, high)
+    daily_errors = residuals.resample("D").sum()
+    daily["p10"] = np.maximum(0, daily.forecast + min(0, daily_errors.quantile(0.1)))
+    daily["p90"] = daily.forecast + max(0, daily_errors.quantile(0.9))
+    validate_bounds(hourly)
+    validate_bounds(daily)
+    return hourly, daily

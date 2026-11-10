@@ -1,18 +1,15 @@
-"""Manual stages with frozen protocols, append-only evidence and atomic exports."""
+"""Independent resumable hybrid experiment; real stages are launched manually."""
 
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 import fcntl
 import hashlib
-import importlib.metadata
 import io
 import json
 import os
 from pathlib import Path
-import platform
-import shutil
 import subprocess
-import tempfile
+import time
 
 import numpy as np
 import pandas as pd
@@ -22,55 +19,72 @@ from forecasting.config import DEVELOPMENT_ORIGINS
 from forecasting.data import hourly_counts, load_studies, sha256_file
 from forecasting.metrics import evaluate, fraction
 from forecasting.pipeline import FROZEN_FILES, frozen_selection
-
-from .client import GENERATION, GenerationError, LLMClient, PartialResponseError, digest
+from llm_forecasting.client import (
+    GENERATION,
+    GenerationError,
+    LLMClient,
+    PartialResponseError,
+    digest,
+)
+from .storage import (
+    atomic_bytes,
+    write_json,
+    write_frame,
+    read_json,
+    hashes,
+    verify_hashes,
+    runtime,
+    repeatability,
+)
 from .prompts import (
-    CHUNK_HOURS,
-    COHERENCE_TOLERANCE,
-    HOUR_LABEL_MAPPING,
-    SCHEMA_POLICY,
-    RecoveredForecast,
+    ALLOCATION_POLICY,
+    BATCH_DAYS,
+    CALIBRATION_POLICY,
     SYSTEM_PROMPT,
-    daily_from_chunks,
-    forecast_chunks,
-    forecast_messages,
-    forecast_hour_keys,
-    forecast_schema,
-    frames_from_reply,
+    allocate,
+    batches,
+    date_keys,
+    empirical_ranges,
     history_summary,
-    inspect_forecast,
-    response_schema_template,
+    hourly_proportions,
+    inspect_reply,
+    messages,
+    response_schema,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE_FILES = tuple(
-    f"llm_forecasting/{name}.py"
-    for name in ("__init__", "__main__", "client", "prompts", "pipeline")
-)
-PROTOCOL_VERSION = 4
-RETRY_POLICY = {
-    "retain_first_valid_hour": True,
-    "request_only_remaining_hours": True,
-    "maximum_calls_per_chunk_invocation": GENERATION["retries"] + 1,
-    "stitched_chunk_stated_total": "undefined",
-}
-DEVELOPMENT_DAYS, FINAL_DAYS, FINAL_RUNS, FORECAST_DAYS = 28, 30, 3, 31
+PROTOCOL_VERSION = 5
+EXPORT_NAME = "llm_forecast.csv"
 REQUEST_COUNTS = {
-    "development": len(DEVELOPMENT_ORIGINS) * DEVELOPMENT_DAYS * 24 // CHUNK_HOURS,
-    "final": FINAL_RUNS * FINAL_DAYS * 24 // CHUNK_HOURS,
-    "october": FORECAST_DAYS * 24 // CHUNK_HOURS,
+    "development": {"main": 42, "calibration": 36},
+    "final": {"main": 45, "calibration": 36},
+    "october": {"main": 16, "calibration": 12},
 }
-EXPECTED_FORECAST_REQUESTS = sum(REQUEST_COUNTS.values())
-MAX_FORECAST_ATTEMPTS = EXPECTED_FORECAST_REQUESTS * (GENERATION["retries"] + 1)
+EXPECTED_BATCHES = sum(sum(counts.values()) for counts in REQUEST_COUNTS.values())
+MAX_ATTEMPTS = EXPECTED_BATCHES * (GENERATION["retries"] + 1)
+SOURCE_FILES = (
+    tuple(
+        f"llm_forecasting/{name}.py"
+        for name in ("__init__", "__main__", "client", "prompts", "pipeline", "storage")
+    )
+    + FROZEN_FILES
+)
+
+RETRY_POLICY = {
+    "first_valid_date": True,
+    "pending_dates_only": True,
+    "maximum_calls_per_batch_invocation": 4,
+    "delays_seconds": [1, 2, 4],
+}
+EXPLORATORY = "Exploratory: September outcomes were already inspected before designing this hybrid."
 
 
 class IncompleteForecastError(ValueError):
-    def __init__(self, failed_chunks):
-        self.failed_chunks = tuple(failed_chunks)
+    def __init__(self, keys):
+        self.keys = tuple(keys)
         super().__init__(
-            f"Stage incomplete: {len(self.failed_chunks)} chunk(s) still missing:\n"
-            + "\n".join(self.failed_chunks)
-            + "\nSuccessful chunks are cached. Rerun the same command to request only missing chunks; no incomplete forecasts or metrics were published."
+            f"Stage incomplete: {len(keys)} missing batches. Accepted daily totals are retained; rerun this stage.\n"
+            + "\n".join(keys)
         )
 
 
@@ -78,59 +92,40 @@ def output(root):
     return Path(root) / "artifacts/llm"
 
 
-def read_json(path):
-    return json.loads(Path(path).read_text())
-
-
-def atomic_bytes(path, content):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=path.parent, prefix=".pending-", delete=False
-        ) as file:
-            temporary = Path(file.name)
-            file.write(content)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def write_json(path, value):
-    atomic_bytes(path, (json.dumps(value, indent=2, allow_nan=False) + "\n").encode())
-
-
-def write_frame(path, frame):
-    atomic_bytes(
-        path,
-        frame.to_csv(
-            index=True, date_format="%Y-%m-%d %H:%M:%S", float_format="%.10f"
-        ).encode(),
-    )
-
-
 @contextmanager
 def exclusive(root):
-    base = output(root)
-    base.mkdir(parents=True, exist_ok=True)
-    with (base / ".pipeline.lock").open("a", encoding="utf-8") as lock:
+    path = output(root) / ".pipeline.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise ValueError(
-                "Another LLM experiment is running; use one at a time"
-            ) from error
+            raise ValueError("Another LLM pipeline is running") from error
         try:
-            # The lock survives journal rotation and is shared by every stage.
-            with (base / "requests.jsonl").open("a", encoding="utf-8"):
-                pass
             yield
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def promoted_evidence(root):
+    path = output(root) / "protocol.json"
+    if not path.exists():
+        return None
+    saved = read_json(path)
+    promotion = saved.get("promotion") if isinstance(saved, dict) else None
+    if not promotion:
+        return None
+    original = promotion["original_protocol"]
+    if (
+        original.get("version") != 1
+        or promotion["original_protocol_sha256"]
+        != hashlib.sha256(promotion["original_protocol_text"].encode()).hexdigest()
+        or json.loads(promotion["original_protocol_text"]) != original
+    ):
+        raise ValueError("Promotion provenance is invalid")
+    verify_journal(root, original)
+    prefix = (output(root) / "requests.jsonl").read_bytes()[: original["journal_bytes"]]
+    return original, len(prefix.splitlines())
 
 
 def records(root):
@@ -139,144 +134,53 @@ def records(root):
         return []
     try:
         rows = [json.loads(line) for line in path.read_text().splitlines()]
-        required = {
-            "key",
-            "stage",
-            "origin",
-            "run",
-            "experiment_sha256",
-            "request_sha256",
-            "status",
-            "received_reply",
-            "latency_seconds",
-        }
-        if any(not isinstance(row, dict) or not required <= row.keys() for row in rows):
-            raise ValueError("Incomplete request record")
-    except (ValueError, TypeError) as error:
+        promoted = promoted_evidence(root)
+        for index, row in enumerate(rows):
+            legacy = promoted is not None and index < promoted[1]
+            if legacy and (
+                row["protocol_version"] != 1
+                or row["stage"] != "development"
+                or row["experiment_sha256"] != promoted[0]["experiment_sha256"]
+            ):
+                raise ValueError("Invalid promoted development evidence")
+            if (
+                (not legacy and row["protocol_version"] != PROTOCOL_VERSION)
+                or row["stage"] not in REQUEST_COUNTS
+                or row["phase"] not in ("main", "calibration")
+                or row["status"]
+                not in (
+                    "valid",
+                    "partial",
+                    "invalid",
+                    "http_error",
+                    "transport_error",
+                    "interrupted",
+                )
+                or not isinstance(row["request"], dict)
+                or row["request_sha256"] != digest(row["request"])
+                or not isinstance(row["experiment_sha256"], str)
+                or len(row["experiment_sha256"]) != 64
+                or not isinstance(row["requested_dates"], list)
+                or not row["key"].startswith(
+                    f"{row['stage']}/{row['origin']}/{row['run']}/{row['phase']}/"
+                )
+            ):
+                raise ValueError("Incompatible hybrid request journal")
+            date_keys(pd.DatetimeIndex(row["requested_dates"]))
+        return rows
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
         raise ValueError(
-            "Request journal is damaged; preserve it for investigation"
+            "Malformed or incompatible hybrid journal; preserve it for inspection"
         ) from error
-    if any(
-        row.get("protocol_version") != PROTOCOL_VERSION
-        or row.get("chunk_hours") != CHUNK_HOURS
-        for row in rows
-    ):
-        raise ValueError(
-            "Incompatible LLM request journal; preserve it and start a separate 12-hour experiment"
-        )
-    return rows
 
 
 def append_record(root, event):
     path = output(root) / "requests.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(event, allow_nan=False) + "\n")
-        file.flush()
-        os.fsync(file.fileno())
-
-
-def prepare_development_journal(root, experiment_sha):
-    """Under exclusive(), rotate only a failed-only, unfrozen older trial."""
-    base = output(root)
-    previous = records(root)
-    if not previous:
-        return
-    if any(
-        not isinstance(row["experiment_sha256"], str) or not row["experiment_sha256"]
-        for row in previous
-    ):
-        raise ValueError(
-            "Request journal has invalid experiment hashes; preserve it for investigation"
-        )
-    previous_hashes = {row["experiment_sha256"] for row in previous}
-    if previous_hashes == {experiment_sha}:
-        return
-
-    protected_paths = [
-        base / "protocol.json",
-        base / "forecast_manifest.json",
-        root / "llm_forecast.csv",
-    ]
-    protected_paths.extend((base / "development").rglob("*"))
-    protected_paths.extend((base / "final").rglob("*"))
-    protected_paths.extend(base.glob("october_*"))
-    failed_statuses = ("invalid", "http_error", "transport_error", "interrupted")
-    if (
-        len(previous_hashes) != 1
-        or any(
-            row["stage"] != "development" or row["status"] not in failed_statuses
-            for row in previous
-        )
-        or any(path.is_file() for path in protected_paths)
-    ):
-        raise ValueError(
-            "Existing evidence belongs to another protocol and is not a failed-only development trial; preserve it and archive the experiment manually"
-        )
-
-    journal = base / "requests.jsonl"
-    try:
-        archive_root = base / "failed_development"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        archive_dir = Path(
-            tempfile.mkdtemp(
-                prefix=datetime.now().strftime("%Y%m%dT%H%M%S-"), dir=archive_root
-            )
-        )
-        destination = archive_dir / "requests.jsonl"
-        os.replace(journal, destination)
-        journal.touch(exist_ok=False)
-    except OSError as error:
-        raise OSError(
-            f"Could not finish archiving the previous development journal under {base / 'failed_development'}; no new forecast was requested. Inspect the preserved files before retrying: {error}"
-        ) from error
-    print(
-        f"Archived {len(previous)} failed development attempts to {destination}. Starting a fresh journal for the updated experiment.",
-        flush=True,
-    )
-
-
-def reset_llm_trial(root=ROOT):
-    """Explicit destructive reset; never called automatically by a CLI stage."""
-    root = Path(root).resolve()
-    base = output(root)
-    if not base.resolve().is_relative_to(root):
-        raise ValueError(
-            "Refusing to reset an LLM artifact directory outside the project"
-        )
-    with exclusive(root):
-        for path in base.iterdir():
-            if path.name == ".pipeline.lock":
-                continue
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-        (root / "llm_forecast.csv").unlink(missing_ok=True)
-    print(
-        "Cleared the previous Part 2 trial. The next develop run starts fresh with labelled hours.",
-        flush=True,
-    )
-
-
-def hashes(root, paths):
-    return {
-        str(Path(path).relative_to(root)): sha256_file(path)
-        for path in sorted(paths)
-        if path.is_file()
-    }
-
-
-def part1_hashes(root):
-    paths = [root / "forecast.csv", *(root / "artifacts").rglob("*")]
-    return hashes(root, [p for p in paths if output(root) not in p.parents])
-
-
-def verify_hashes(root, expected):
-    for name, checksum in expected.items():
-        path = root / name
-        if not path.is_file() or sha256_file(path) != checksum:
-            raise ValueError(f"Frozen file changed or is missing: {name}")
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, allow_nan=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def journal_snapshot(root):
@@ -293,156 +197,404 @@ def verify_journal(root, saved):
         len(content) != saved["journal_bytes"]
         or hashlib.sha256(content).hexdigest() != saved["journal_sha256"]
     ):
-        raise ValueError("Saved request evidence changed")
+        raise ValueError("Hybrid request evidence changed")
 
 
-def runtime():
-    return {
-        "python": platform.python_version(),
-        **{
-            name: importlib.metadata.version(name)
-            for name in ("numpy", "pandas", "scikit-learn", "httpx", "pydantic")
-        },
-    }
+def baseline_files(root):
+    frozen_selection(root)
+    paths = [
+        Path(root) / "forecast.csv",
+        Path(root) / "artifacts/selection.json",
+        Path(root) / "artifacts/daily_forecast.csv",
+        Path(root) / "artifacts/forecast_metadata.json",
+    ]
+    for name in ("development", "final"):
+        paths.extend((Path(root) / "artifacts" / name).rglob("*"))
+    return hashes(root, paths)
 
 
 def protocol_base(root, client):
-    frozen_selection(root)  # Part 1 must already have committed, frozen results.
-    if platform.python_version() != "3.13.18":
-        raise ValueError("Run assignment experiments using main_env Python 3.13.18")
+    if runtime()["python"] != "3.13.18":
+        raise ValueError("Use main_env Python 3.13.18")
     return {
         "version": PROTOCOL_VERSION,
-        "chunk_hours": CHUNK_HOURS,
-        "request_counts": REQUEST_COUNTS,
-        "expected_forecast_requests": EXPECTED_FORECAST_REQUESTS,
+        "batch_days": BATCH_DAYS,
+        "system_prompt": SYSTEM_PROMPT,
+        "schema_example": response_schema(pd.date_range("2026-07-07", periods=2)),
+        "schema_policy": "exact requested ISO date keys; strict envelope; independent daily numeric validation",
+        "allocation": ALLOCATION_POLICY,
+        "calibration": CALIBRATION_POLICY,
+        "retry_policy": RETRY_POLICY,
+        "generation": dict(GENERATION),
         "provider": client.settings.public(),
-        "generation": GENERATION,
         "identity": client.identity(),
         "runtime": runtime(),
-        "data_sha256": sha256_file(root / "data/studies.csv"),
-        "sources": hashes(root, [root / name for name in SOURCE_FILES]),
-        "part1_sources": hashes(root, [root / name for name in FROZEN_FILES]),
-        "part1_results": part1_hashes(root),
-        "system_prompt": SYSTEM_PROMPT,
-        "schema_template": response_schema_template(),
-        "hour_label_mapping": HOUR_LABEL_MAPPING,
-        "schema_policy": SCHEMA_POLICY,
-        "retry_policy": RETRY_POLICY,
+        "data_sha256": sha256_file(Path(root) / "data/studies.csv"),
+        "sources": hashes(root, [Path(root) / name for name in SOURCE_FILES]),
+        "baseline_files": baseline_files(root),
         "development_origins": list(DEVELOPMENT_ORIGINS),
-        "development_days": DEVELOPMENT_DAYS,
+        "development_days": 28,
         "final_origin": "2026-09-01",
-        "final_days": FINAL_DAYS,
-        "final_runs": FINAL_RUNS,
+        "final_days": 30,
+        "final_runs": 3,
         "forecast_origin": "2026-10-01",
-        "forecast_days": FORECAST_DAYS,
-        "max_forecast_attempts": MAX_FORECAST_ATTEMPTS,
-        "coherence_tolerance": COHERENCE_TOLERANCE,
-        "daily_stated_total_definition": "sum of two known full-chunk model totals; undefined when either chunk is stitched from partial replies",
+        "forecast_days": 31,
+        "request_counts": REQUEST_COUNTS,
+        "expected_batches": EXPECTED_BATCHES,
+        "maximum_attempts": MAX_ATTEMPTS,
+        "evaluation_status": EXPLORATORY,
         "api_budget_usd": 0,
-        "daily_point_definition": "sum_of_hourly_p50; not necessarily a daily median",
+        "coherence": "daily/hourly equality enforced by Python, not LLM arithmetic",
     }
 
 
-def validate_protocol_contract(saved):
-    if (
-        saved.get("version") != PROTOCOL_VERSION
-        or saved.get("chunk_hours") != CHUNK_HOURS
-        or saved.get("schema_template") != response_schema_template()
-        or saved.get("hour_label_mapping") != HOUR_LABEL_MAPPING
-        or saved.get("schema_policy") != SCHEMA_POLICY
-        or saved.get("retry_policy") != RETRY_POLICY
-        or saved.get("request_counts") != REQUEST_COUNTS
-        or saved.get("expected_forecast_requests") != EXPECTED_FORECAST_REQUESTS
-        or saved.get("max_forecast_attempts") != MAX_FORECAST_ATTEMPTS
-    ):
-        raise ValueError(
-            "Incompatible LLM protocol; preserve it and start a separate 12-hour experiment"
-        )
+def frozen_protocol(root):
+    return validate_protocol(root)
 
 
-def frozen_protocol(root=ROOT):
-    root = Path(root)
+def validate_protocol(root, *, committed=True):
     path = output(root) / "protocol.json"
     saved = read_json(path)
-    validate_protocol_contract(saved)
-    for field in ("sources", "part1_sources", "part1_results", "development_files"):
-        verify_hashes(root, saved[field])
-    verify_journal(root, saved)
-    if saved["generation"] != GENERATION or saved["runtime"] != runtime():
-        raise ValueError("Frozen generation settings or Python dependencies changed")
-    if sha256_file(root / "data/studies.csv") != saved["data_sha256"]:
-        raise ValueError("Input data changed after development")
-    try:
-        committed = subprocess.check_output(
-            ["git", "show", "HEAD:artifacts/llm/protocol.json"],
-            cwd=root,
-            stderr=subprocess.PIPE,
+    required = {
+        "sources",
+        "baseline_files",
+        "development_files",
+        "journal_bytes",
+        "journal_sha256",
+        "data_sha256",
+        "experiment_sha256",
+        "provider",
+        "identity",
+    }
+    if not isinstance(saved, dict) or not required <= set(saved):
+        raise ValueError("Malformed hybrid protocol; preserve it for inspection")
+    base = {
+        key: value
+        for key, value in saved.items()
+        if key
+        not in (
+            "experiment_sha256",
+            "development_files",
+            "journal_bytes",
+            "journal_sha256",
         )
-        if committed != path.read_bytes():
-            raise ValueError(
-                "Commit the exact LLM protocol before September evaluation"
-            )
-        for name, checksum in {
-            **saved["sources"],
-            **saved["development_files"],
-        }.items():
-            content = subprocess.check_output(
-                ["git", "show", f"HEAD:{name}"], cwd=root, stderr=subprocess.PIPE
-            )
-            if hashlib.sha256(content).hexdigest() != checksum:
-                raise ValueError(
-                    "Commit the exact LLM implementation and development files before September evaluation"
-                )
-        journal = subprocess.check_output(
-            ["git", "show", "HEAD:artifacts/llm/requests.jsonl"],
-            cwd=root,
-            stderr=subprocess.PIPE,
-        )
-        if (
-            hashlib.sha256(journal[: saved["journal_bytes"]]).hexdigest()
-            != saved["journal_sha256"]
-        ):
-            raise ValueError(
-                "Commit the development request evidence before September evaluation"
-            )
-    except subprocess.CalledProcessError as error:
+    }
+    if (
+        saved.get("version") != PROTOCOL_VERSION
+        or saved.get("experiment_sha256") != digest(base)
+        or saved.get("allocation") != ALLOCATION_POLICY
+        or saved.get("calibration") != CALIBRATION_POLICY
+        or saved.get("generation") != GENERATION
+        or saved.get("retry_policy") != RETRY_POLICY
+        or saved.get("request_counts") != REQUEST_COUNTS
+        or saved.get("maximum_attempts") != MAX_ATTEMPTS
+        or saved.get("system_prompt") != SYSTEM_PROMPT
+        or saved.get("runtime") != runtime()
+    ):
         raise ValueError(
-            "Commit the LLM implementation, protocol and development results first"
-        ) from error
+            "Hybrid protocol or runtime is incompatible; preserve the experiment"
+        )
+    for field in ("sources", "baseline_files", "development_files"):
+        verify_hashes(root, saved[field])
+    if sha256_file(Path(root) / "data/studies.csv") != saved["data_sha256"]:
+        raise ValueError("Input data changed after hybrid development")
+    verify_journal(root, saved)
+    if committed:
+        try:
+            relative = str(path.relative_to(root))
+            if (
+                subprocess.check_output(
+                    ["git", "show", f"HEAD:{relative}"],
+                    cwd=root,
+                    stderr=subprocess.PIPE,
+                )
+                != path.read_bytes()
+            ):
+                raise ValueError("Commit the exact hybrid protocol before September")
+            for name, checksum in {
+                **saved["sources"],
+                **saved["development_files"],
+            }.items():
+                value = subprocess.check_output(
+                    ["git", "show", f"HEAD:{name}"], cwd=root, stderr=subprocess.PIPE
+                )
+                if hashlib.sha256(value).hexdigest() != checksum:
+                    raise ValueError(
+                        "Commit the exact hybrid sources and development results"
+                    )
+            content = subprocess.check_output(
+                ["git", "show", "HEAD:artifacts/llm/requests.jsonl"],
+                cwd=root,
+                stderr=subprocess.PIPE,
+            )
+            if (
+                len(content) < saved["journal_bytes"]
+                or hashlib.sha256(content[: saved["journal_bytes"]]).hexdigest()
+                != saved["journal_sha256"]
+            ):
+                raise ValueError("Commit hybrid development request evidence")
+        except subprocess.CalledProcessError as error:
+            raise ValueError(
+                "Commit hybrid sources, protocol, development and journal first"
+            ) from error
     return saved
 
 
-def check_client(client, protocol):
+def check_client(client, saved):
     if (
-        client.settings.public() != protocol["provider"]
-        or client.identity() != protocol["identity"]
+        client.settings.public() != saved["provider"]
+        or client.identity() != saved["identity"]
     ):
-        raise ValueError(
-            "Provider, installed model or Ollama changed after development"
+        raise ValueError("Provider, model or Ollama changed after hybrid development")
+
+
+def recover_batch(
+    summary, dates, root, client, key, stage, phase, origin, run, experiment_sha
+):
+    accepted = {}
+    previous = records(root)
+    if any(
+        row["experiment_sha256"] != experiment_sha
+        and row["protocol_version"] == PROTOCOL_VERSION
+        for row in previous
+    ):
+        raise ValueError("Hybrid evidence belongs to another experiment; preserve it")
+
+    def pending():
+        return dates[[key not in accepted for key in date_keys(dates)]]
+
+    def request():
+        missing = pending()
+        return messages(summary, dates, missing), response_schema(missing)
+
+    for row in (row for row in previous if row["key"] == key):
+        if pending().empty:
+            raise ValueError("Cached requests exist after a batch was complete")
+        prompt, schema = request()
+        _, payload = client.payload(prompt, schema, GENERATION["max_output_tokens"])
+        if row["request"] != payload or row["requested_dates"] != date_keys(pending()):
+            raise ValueError("Cached hybrid prompt, schema or settings mismatch")
+        inspection = row.get("day_validation")
+        if inspection is not None:
+            normalized, _, _, truncated = client._normalize(
+                json.loads(row["raw_response"])
+            )
+            if truncated or normalized != row["text"]:
+                raise ValueError(
+                    "Cached daily text differs from its raw provider response"
+                )
+            if row["status"] not in ("valid", "partial", "invalid"):
+                raise ValueError("Cached validation has an incompatible status")
+            checked = inspect_reply(row["text"], pending())
+            if checked != inspection:
+                raise ValueError("Cached daily values differ from the raw response")
+            expected_status = (
+                "valid"
+                if not checked["failed_days"]
+                else ("partial" if checked["accepted_days"] else "invalid")
+            )
+            if row["status"] != expected_status:
+                raise ValueError("Cached daily acceptance status was modified")
+            accepted.update(checked["accepted_days"])
+        elif row["status"] in ("valid", "partial"):
+            raise ValueError("Cached success lacks daily validation evidence")
+    if pending().empty:
+        return accepted
+    state = {}
+
+    def factory():
+        state.clear()
+        state.update(dates=pending(), inspection=None)
+        print(f"{key}: requesting dates {date_keys(state['dates'])}", flush=True)
+        return request()
+
+    def validate(text):
+        inspection = inspect_reply(text, state["dates"])
+        state["inspection"] = inspection
+        accepted.update(inspection["accepted_days"])
+        if inspection["failed_days"]:
+            error = PartialResponseError if inspection["accepted_days"] else ValueError
+            raise error(
+                "Missing or invalid daily totals: "
+                + ", ".join(inspection["failed_days"])
+            )
+        return accepted
+
+    def before_attempt():
+        if len(records(root)) >= MAX_ATTEMPTS:
+            raise ValueError(
+                f"The fixed {MAX_ATTEMPTS}-attempt hybrid budget is exhausted"
+            )
+
+    def record(event):
+        append_record(
+            root,
+            {
+                **event,
+                "protocol_version": PROTOCOL_VERSION,
+                "key": key,
+                "stage": stage,
+                "phase": phase,
+                "origin": str(origin),
+                "run": run,
+                "experiment_sha256": experiment_sha,
+                "requested_dates": date_keys(state["dates"]),
+                "day_validation": state["inspection"],
+            },
         )
+
+    return client.generate(
+        [],
+        {},
+        validate,
+        request_factory=factory,
+        before_attempt=before_attempt,
+        record=record,
+        max_output_tokens=GENERATION["max_output_tokens"],
+    )
+
+
+def predict_period(
+    series,
+    period_origin,
+    days,
+    root,
+    client,
+    stage,
+    phase,
+    outer_origin,
+    run,
+    experiment_sha,
+):
+    summary = history_summary(series, period_origin)
+    accepted, failures = {}, []
+    for dates in batches(period_origin, days):
+        key = f"{stage}/{outer_origin}/{run}/{phase}/{pd.Timestamp(period_origin).isoformat()}/{dates[0].isoformat()}"
+        try:
+            values = recover_batch(
+                summary,
+                dates,
+                root,
+                client,
+                key,
+                stage,
+                phase,
+                outer_origin,
+                run,
+                experiment_sha,
+            )
+            accepted.update(values)
+        except GenerationError as error:
+            if any(
+                row.get("http_status") in (400, 401, 403, 404, 405, 422)
+                or (
+                    row.get("input_tokens") is not None
+                    and row.get("input_token_budget") is not None
+                    and row["input_tokens"] > row["input_token_budget"]
+                )
+                for row in error.records
+            ):
+                raise
+            failures.append(key)
+            print(f"{key}: exhausted retries; continuing. {error}", flush=True)
+    if failures:
+        raise IncompleteForecastError(failures)
+    totals = {
+        str(day.date()): accepted[str(day.date())]
+        for day in pd.date_range(period_origin, periods=days)
+    }
+    proportions = hourly_proportions(series, period_origin)
+    return allocate(totals, proportions), proportions, totals
+
+
+def forecast_window(series, origin, days, run, stage, root, client, experiment_sha):
+    started = time.perf_counter()
+    wall_started = datetime.now(UTC)
+    failures, calibration, profiles = [], [], []
+    periods = [
+        (pd.Timestamp(origin) - pd.Timedelta(days=offset), 7, "calibration")
+        for offset in (21, 14, 7)
+    ]
+    periods.append((pd.Timestamp(origin), days, "main"))
+    main = None
+    for period_origin, period_days, phase in periods:
+        try:
+            hourly, proportions, totals = predict_period(
+                series,
+                period_origin,
+                period_days,
+                root,
+                client,
+                stage,
+                phase,
+                origin,
+                run,
+                experiment_sha,
+            )
+        except IncompleteForecastError as error:
+            failures.extend(error.keys)
+            continue
+        profiles.append(
+            proportions.assign(phase=phase, profile_origin=str(period_origin))
+        )
+        if phase == "main":
+            main = hourly, totals
+        else:
+            actual = series.reindex(hourly.index)
+            if actual.isna().any():
+                raise ValueError(
+                    "Calibration requires observed counts before the outer origin"
+                )
+            calibration.append(
+                hourly.assign(
+                    actual=actual,
+                    residual=actual - hourly.forecast,
+                    calibration_origin=str(period_origin),
+                )
+            )
+    if failures:
+        raise IncompleteForecastError(failures)
+    calibration = pd.concat(calibration)
+    hourly, daily = empirical_ranges(main[0], calibration.residual)
+    daily["llm_total"] = list(main[1].values())
+    daily["allocation_error"] = daily.forecast - daily.llm_total
+    daily["coherent"] = daily.allocation_error.abs() <= 1e-6
+    prior_starts = [
+        pd.Timestamp(row["started_at"]).to_pydatetime()
+        for row in records(root)
+        if row["stage"] == stage and row["origin"] == str(origin) and row["run"] == run
+    ]
+    return {
+        "hourly": hourly,
+        "daily": daily,
+        "calibration": calibration,
+        "proportions": pd.concat(profiles, ignore_index=True),
+        "invocation_seconds": time.perf_counter() - started,
+        "complete_forecast_seconds": (
+            datetime.now(UTC) - min([wall_started, *prior_starts])
+        ).total_seconds(),
+    }
 
 
 def reliability(events):
     replies = [row for row in events if row["received_reply"]]
-    invalid = sum(row["status"] in ("invalid", "partial") for row in replies)
-    requested = sum(len(row.get("requested_hour_keys", [])) for row in events)
-    accepted = sum(
-        len((row.get("hour_validation") or {}).get("accepted_hours", {}))
-        for row in events
-    )
     latencies = [row["latency_seconds"] for row in events]
+    invalid = sum(row["status"] in ("invalid", "partial") for row in replies)
     return {
         "attempts": len(events),
         "received_replies": len(replies),
         "invalid_replies": invalid,
         "invalid_reply_share": fraction(invalid, len(replies)),
         "partial_replies": sum(row["status"] == "partial" for row in replies),
-        "requested_hour_values": requested,
-        "accepted_hour_values": accepted,
-        "hour_acceptance_share": fraction(accepted, requested),
+        "retry_calls": len(events) - len({row["key"] for row in events}),
+        "accepted_daily_values": sum(
+            len((row.get("day_validation") or {}).get("accepted_days", {}))
+            for row in events
+        ),
+        "requested_daily_values": sum(len(row["requested_dates"]) for row in events),
         "transport_failures": sum(row["status"] == "transport_error" for row in events),
-        "interrupted_attempts": sum(row["status"] == "interrupted" for row in events),
         "http_failures": sum(row["status"] == "http_error" for row in events),
+        "interrupted_attempts": sum(row["status"] == "interrupted" for row in events),
         "mean_call_seconds": float(np.mean(latencies)) if latencies else None,
         "active_request_seconds": float(
             sum(latencies) + sum(row.get("retry_delay_seconds", 0) for row in events)
@@ -454,492 +606,267 @@ def reliability(events):
             for row in events
         ),
         "api_cost_usd": 0.0,
-        "cost_excludes": "electricity and hardware",
+        "cost_excludes": "hardware and electricity",
+        "per_call": [
+            {
+                "key": row["key"],
+                "attempt": row["attempt"],
+                "status": row["status"],
+                "latency_seconds": row["latency_seconds"],
+                "input_tokens": row.get("input_tokens"),
+                "output_tokens": row.get("output_tokens"),
+            }
+            for row in events
+        ],
     }
 
 
-def pending_hours(hours, accepted):
-    return hours[[key not in accepted for key in forecast_hour_keys(hours)]]
-
-
-def replay_hour_cache(matching, summary, hours, client):
-    accepted, stated_total = {}, None
-    for row in matching:
-        remaining = pending_hours(hours, accepted)
-        if remaining.empty:
-            raise ValueError(
-                "Saved requests exist after this chunk was already complete"
+def stage_reliability(root, stage):
+    events = [row for row in records(root) if row["stage"] == stage]
+    windows = []
+    for origin, run in sorted({(row["origin"], row["run"]) for row in events}):
+        subset = [
+            row for row in events if row["origin"] == origin and row["run"] == run
+        ]
+        starts = [pd.Timestamp(row["started_at"]) for row in subset]
+        ends = [
+            pd.Timestamp(row["started_at"])
+            + pd.Timedelta(
+                seconds=row["latency_seconds"] + row.get("retry_delay_seconds", 0)
             )
-        messages = forecast_messages(summary, hours, remaining)
-        schema = forecast_schema(remaining)
-        _, payload = client.payload(messages, schema, GENERATION["max_output_tokens"])
-        if row["request_sha256"] != digest(payload) or row.get("request") != payload:
-            raise ValueError("A saved chunk has a different prompt or settings")
-        inspection = row.get("hour_validation")
-        if inspection is None:
-            if row["status"] in ("valid", "partial"):
-                raise ValueError("Cached forecast lacks per-hour validation evidence")
-            continue
-        checked = inspect_forecast(row["text"], remaining)
-        if checked != inspection:
-            raise ValueError("Cached hourly validation differs from the raw response")
-        accepted.update(checked["accepted_hours"])
-        if len(remaining) == CHUNK_HOURS and not checked["failed_hours"]:
-            stated_total = checked["stated_total"]
-    return accepted, stated_total
-
-
-def recover_chunk(
-    summary, hours, matching, root, client, key, stage, origin, run, experiment_sha
-):
-    accepted, stated_total = replay_hour_cache(matching, summary, hours, client)
-    cached = len(accepted)
-    if cached == CHUNK_HOURS:
-        return RecoveredForecast(accepted, stated_total), cached
-    state = {}
-
-    def request_factory():
-        remaining = pending_hours(hours, accepted)
-        state.clear()
-        state.update(hours=remaining, inspection=None)
-        print(
-            f"{key}: requesting {len(remaining)} remaining hours {forecast_hour_keys(remaining)}",
-            flush=True,
-        )
-        return forecast_messages(summary, hours, remaining), forecast_schema(remaining)
-
-    def validate(text):
-        nonlocal stated_total
-        remaining = state["hours"]
-        inspection = inspect_forecast(text, remaining)
-        state["inspection"] = inspection
-        accepted.update(inspection["accepted_hours"])
-        if len(remaining) == CHUNK_HOURS and not inspection["failed_hours"]:
-            stated_total = inspection["stated_total"]
-        if inspection["failed_hours"]:
-            print(
-                f"{key}: retained {len(accepted)}/{CHUNK_HOURS} valid hours; remaining {list(inspection['failed_hours'])}",
-                flush=True,
-            )
-            error_type = (
-                PartialResponseError if inspection["accepted_hours"] else ValueError
-            )
-            raise error_type(
-                "Invalid or missing hours: " + ", ".join(inspection["failed_hours"])
-            )
-        return RecoveredForecast(accepted, stated_total)
-
-    def before_attempt():
-        if len(records(root)) >= MAX_FORECAST_ATTEMPTS:
-            raise ValueError(
-                f"The fixed {MAX_FORECAST_ATTEMPTS}-attempt experiment budget is exhausted"
-            )
-
-    def record(event):
-        append_record(
-            root,
+            for row in subset
+        ]
+        windows.append(
             {
-                **event,
-                "protocol_version": PROTOCOL_VERSION,
-                "chunk_hours": CHUNK_HOURS,
-                "key": key,
-                "stage": stage,
-                "origin": str(origin),
+                "origin": origin,
                 "run": run,
-                "experiment_sha256": experiment_sha,
-                "requested_hour_keys": forecast_hour_keys(state["hours"]),
-                "hour_validation": state["inspection"],
-            },
+                "elapsed_wall_seconds": (max(ends) - min(starts)).total_seconds(),
+                **reliability(subset),
+            }
         )
-
-    reply = client.generate(
-        [],
-        {},
-        validate,
-        record=record,
-        before_attempt=before_attempt,
-        max_output_tokens=GENERATION["max_output_tokens"],
-        request_factory=request_factory,
-    )
-    return reply, cached
-
-
-def forecast_window(series, origin, days, run, stage, root, client, experiment_sha):
-    summary = history_summary(series, origin)
-    hourly_parts, chunk_parts = [], []
-    failed_chunks, reused = [], 0
-    for hours in forecast_chunks(origin, days):
-        key = f"{stage}/{origin}/{run}/{hours[0].isoformat()}"
-        previous = records(root)
-        if any(row["experiment_sha256"] != experiment_sha for row in previous):
-            raise ValueError(
-                "Existing evidence belongs to another protocol; archive this LLM experiment before new development"
-            )
-        matching = [row for row in previous if row["key"] == key]
-        try:
-            reply, cached = recover_chunk(
-                summary,
-                hours,
-                matching,
-                root,
-                client,
-                key,
-                stage,
-                origin,
-                run,
-                experiment_sha,
-            )
-            reused += cached == CHUNK_HOURS
-        except GenerationError as error:
-            # Configuration/context errors are systemic, rather than a
-            # missing prediction that another calendar chunk can resolve.
-            if any(
-                attempt.get("http_status") in (400, 401, 403, 404, 405, 422)
-                or (
-                    attempt.get("input_tokens") is not None
-                    and attempt.get("input_token_budget") is not None
-                    and attempt["input_tokens"] > attempt["input_token_budget"]
-                )
-                for attempt in error.records
-            ):
-                raise
-            failed_chunks.append(key)
-            print(
-                f"{key}: failed after four attempts; continuing with later chunks. {error}",
-                flush=True,
-            )
-            continue
-        hourly, chunks = frames_from_reply(reply, hours)
-        hourly_parts.append(hourly)
-        chunk_parts.append(chunks)
-    print(
-        f"{stage}/{origin}/{run}: {len(hourly_parts)}/{days * 24 // CHUNK_HOURS} chunks ready ({reused} reused, {len(failed_chunks)} missing).",
-        flush=True,
-    )
-    if failed_chunks:
-        raise IncompleteForecastError(failed_chunks)
-    hourly, chunks = pd.concat(hourly_parts), pd.concat(chunk_parts)
-    return hourly, daily_from_chunks(hourly, chunks), chunks
-
-
-def score_window(actual, hourly, daily):
-    # Daily intervals are unavailable. NaN placeholders adapt the existing metric
-    # interface; replace their coverage/width with undefined before publication.
-    scores = evaluate(
-        actual,
-        hourly.assign(crossed_before_sort=False),
-        daily.assign(p10=np.nan, p90=np.nan),
-        quantile_model=True,
-    )
-    for metrics in scores.values():
-        metrics["daily_coverage"] = None
-        metrics["mean_daily_interval_width"] = None
-    return scores
+    return {
+        "combined": reliability(events),
+        "main": reliability([r for r in events if r["phase"] == "main"]),
+        "calibration": reliability([r for r in events if r["phase"] == "calibration"]),
+        "windows": windows,
+        "timing_note": "Call latency includes loading/unloading; active time includes retries. Wall spans include manual pauses on resume and exclude final file-writing overhead.",
+    }
 
 
 def collect_windows(series, windows, stage, root, client, experiment_sha):
-    """Try all independent windows before deciding whether a stage is complete."""
-    completed, failed_chunks = [], []
+    completed, failures = [], []
     for origin, days, run in windows:
         try:
             frames = forecast_window(
                 series, origin, days, run, stage, root, client, experiment_sha
             )
-        except IncompleteForecastError as error:
-            failed_chunks.extend(error.failed_chunks)
-        else:
             completed.append((origin, days, run, frames))
-    if failed_chunks:
-        raise IncompleteForecastError(failed_chunks)
+        except IncompleteForecastError as error:
+            failures.extend(error.keys)
+    if failures:
+        raise IncompleteForecastError(failures)
     return completed
 
 
-def save_window(
-    series, origin, days, run, stage, root, client, experiment_sha, *, frames=None
-):
-    hourly, daily, chunks = (
-        frames
-        if frames is not None
-        else forecast_window(
-            series, origin, days, run, stage, root, client, experiment_sha
+def save_windows(root, series, completed, stage):
+    metrics = []
+    for origin, days, run, frames in completed:
+        prefix = output(root) / stage / f"{origin}_run{run}"
+        actual = series.reindex(frames["hourly"].index)
+        if stage != "october" and actual.isna().any():
+            raise ValueError("Backtest extends beyond observed data")
+        hourly, daily = frames["hourly"].copy(), frames["daily"].copy()
+        if stage != "october":
+            hourly["actual"] = actual
+            daily["actual"] = actual.resample("D").sum()
+            scores = evaluate(
+                actual,
+                hourly.assign(crossed_before_sort=False),
+                daily,
+                quantile_model=True,
+            )
+            for scope, values in scores.items():
+                metrics.append(
+                    {
+                        "origin": origin,
+                        "candidate": f"hybrid_run{run}",
+                        "scope": scope,
+                        "run": run,
+                        "interval_method": "empirical_hybrid_residuals",
+                        **values,
+                    }
+                )
+        for name, frame in (
+            ("hourly", hourly),
+            ("daily", daily),
+            ("calibration", frames["calibration"]),
+        ):
+            write_frame(Path(f"{prefix}_{name}.csv"), frame)
+        write_frame(
+            Path(f"{prefix}_proportions.csv"),
+            frames["proportions"].set_index(
+                ["phase", "profile_origin", "weekday", "hour"]
+            ),
         )
-    )
     base = output(root) / stage
-    label = f"{origin}_run{run}"
-    actual = series.reindex(hourly.index)
-    if actual.isna().any():
-        raise ValueError("Backtest extends beyond observed history")
-    write_frame(base / f"{label}_hourly.csv", hourly.assign(actual=actual))
-    write_frame(base / f"{label}_chunks.csv", chunks)
-    write_frame(
-        base / f"{label}_daily.csv", daily.assign(actual=actual.resample("D").sum())
-    )
-    scores = score_window(actual, hourly, daily)
-    return [
-        {
-            "origin": origin,
-            "candidate": f"qwen_run{run}",
-            "run": run,
-            "scope": scope,
-            **values,
-        }
-        for scope, values in scores.items()
-    ]
-
-
-def stage_reliability(root, stage):
-    events = [row for row in records(root) if row["stage"] == stage]
-    result = reliability(events)
-    groups = sorted({(row["origin"], row["run"]) for row in events})
-    result["windows"] = []
-    for origin, run in groups:
-        rows = [row for row in events if (row["origin"], row["run"]) == (origin, run)]
-        stats = reliability(rows)
-        starts = [datetime.fromisoformat(row["started_at"]) for row in rows]
-        ends = [
-            start + timedelta(seconds=row["latency_seconds"])
-            for start, row in zip(starts, rows, strict=True)
-        ]
-        result["windows"].append(
-            {
-                "origin": origin,
-                "run": run,
-                "elapsed_wall_seconds": (max(ends) - min(starts)).total_seconds(),
-                **stats,
-            }
+    if metrics:
+        write_frame(
+            base / "metrics.csv",
+            pd.DataFrame(metrics).set_index(["origin", "candidate", "scope"]),
         )
-    result["elapsed_note"] = (
-        "Wall time includes manual pauses if a failed stage is resumed; active time includes call latency and retry delays."
+    stats = stage_reliability(root, stage)
+    timings = {(origin, run): frames for origin, _, run, frames in completed}
+    for window in stats["windows"]:
+        frames = timings[(window["origin"], window["run"])]
+        window.update(
+            complete_forecast_seconds=frames["complete_forecast_seconds"],
+            last_invocation_seconds=frames["invocation_seconds"],
+        )
+    stats["complete_timing_note"] = (
+        "Complete forecast time includes calibration, loading, retries and allocation; resumed windows include manual pauses. Last invocation excludes earlier attempts. Final file-writing time is excluded."
     )
-    return result
+    write_json(base / "reliability.json", stats)
+    return metrics
 
 
 def develop(root=ROOT, client=None):
     root = Path(root)
-    base = output(root)
     with exclusive(root):
-        if (base / "final/manifest.json").exists():
-            raise ValueError("September evaluation has started; development is frozen")
-        if (base / "protocol.json").exists():
-            validate_protocol_contract(read_json(base / "protocol.json"))
+        if (output(root) / "final/manifest.json").exists():
             raise ValueError(
-                "Development protocol already exists; commit it and run evaluate-final"
+                "Hybrid September evaluation has started; development is frozen"
             )
-        records(root)  # Reject legacy evidence before contacting the provider.
+        if (output(root) / "protocol.json").exists():
+            validate_protocol(root, committed=False)
+            print(
+                "Hybrid development already complete; commit it and run evaluate-final."
+            )
+            return
         client = client or LLMClient()
         protocol = protocol_base(root, client)
         experiment_sha = digest(protocol)
-        prepare_development_journal(root, experiment_sha)
+        if any(row["experiment_sha256"] != experiment_sha for row in records(root)):
+            raise ValueError(
+                "Existing hybrid journal belongs to another protocol; preserve it"
+            )
         series = hourly_counts(load_studies(root / "data/studies.csv"))
         completed = collect_windows(
             series,
-            [(origin, DEVELOPMENT_DAYS, 1) for origin in DEVELOPMENT_ORIGINS],
+            [(origin, 28, 1) for origin in DEVELOPMENT_ORIGINS],
             "development",
             root,
             client,
             experiment_sha,
         )
-        metrics = []
-        for origin, days, run, frames in completed:
-            metrics.extend(
-                save_window(
-                    series,
-                    origin,
-                    days,
-                    run,
-                    "development",
-                    root,
-                    client,
-                    experiment_sha,
-                    frames=frames,
-                )
-            )
-        write_frame(
-            base / "development/metrics.csv",
-            pd.DataFrame(metrics).set_index(["origin", "candidate", "scope"]),
-        )
-        write_json(
-            base / "development/reliability.json",
-            stage_reliability(root, "development"),
-        )
+        save_windows(root, series, completed, "development")
         protocol.update(
             experiment_sha256=experiment_sha,
-            development_files=hashes(root, (base / "development").rglob("*")),
+            development_files=hashes(root, (output(root) / "development").rglob("*")),
             **journal_snapshot(root),
         )
-        write_json(base / "protocol.json", protocol)
+        write_json(output(root) / "protocol.json", protocol)
         print(
-            "Saved development results. Manually commit llm_forecasting, tests and artifacts/llm before evaluate-final.",
-            flush=True,
+            "Saved hybrid development. Manually commit hybrid sources, protocol, journal and results before evaluate-final."
         )
 
 
 def verify_manifest(root, manifest):
-    if manifest["protocol_sha256"] != sha256_file(output(root) / "protocol.json"):
-        raise ValueError("Results belong to a different frozen LLM protocol")
+    if manifest.get("protocol_sha256") != sha256_file(output(root) / "protocol.json"):
+        raise ValueError("Hybrid results belong to another protocol")
     if manifest.get("complete"):
         verify_hashes(root, manifest["files"])
         verify_journal(root, manifest)
 
 
-def repeatability(frames):
-    if len(frames) != 3 or any(
-        not frame.index.equals(frames[0].index) for frame in frames
-    ):
-        raise ValueError("Repeatability requires three complete aligned runs")
-    matrix = pd.concat(
-        [frame.forecast.rename(f"run{i}") for i, frame in enumerate(frames, 1)], axis=1
-    )
-    daily = matrix.resample("D").sum()
-    totals = matrix.sum()
-    return {
-        "monthly_totals": totals.to_dict(),
-        "monthly_total_range": float(totals.max() - totals.min()),
-        "pairwise_hourly_mae": [
-            {
-                "runs": [f"run{i+1}", f"run{j+1}"],
-                "mae": float((matrix.iloc[:, i] - matrix.iloc[:, j]).abs().mean()),
-            }
-            for i in range(3)
-            for j in range(i + 1, 3)
-        ],
-        "mean_hourly_std": float(matrix.std(axis=1, ddof=0).mean()),
-        "max_hourly_std": float(matrix.std(axis=1, ddof=0).max()),
-        "daily_total_std": {
-            str(day.date()): float(value)
-            for day, value in daily.std(axis=1, ddof=0).items()
-        },
-        "std_definition": "population standard deviation across the three realized runs",
-    }
-
-
 def evaluate_final(root=ROOT, client=None):
     root = Path(root)
     with exclusive(root):
-        protocol = frozen_protocol(root)
+        protocol = validate_protocol(root)
         path = output(root) / "final/manifest.json"
         if path.exists():
             manifest = read_json(path)
             verify_manifest(root, manifest)
             if manifest.get("complete"):
-                print("Preserving completed September results; no LLM calls made.")
+                print("Preserving completed hybrid September results; no calls made.")
                 return
         else:
-            commit = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=root, text=True
-            ).strip()
             manifest = {
                 "protocol_sha256": sha256_file(output(root) / "protocol.json"),
-                "pre_evaluation_commit": commit,
+                "pre_evaluation_commit": subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=root, text=True
+                ).strip(),
                 "complete": False,
+                "evaluation_status": EXPLORATORY,
             }
-            write_json(
-                path, manifest
-            )  # Freeze development even if the first call fails.
+            write_json(path, manifest)
         client = client or LLMClient()
         check_client(client, protocol)
         series = hourly_counts(load_studies(root / "data/studies.csv"))
         completed = collect_windows(
             series,
-            [("2026-09-01", FINAL_DAYS, run) for run in range(1, FINAL_RUNS + 1)],
+            [("2026-09-01", 30, run) for run in (1, 2, 3)],
             "final",
             root,
             client,
             protocol["experiment_sha256"],
         )
-        metrics, frames = [], []
-        for origin, days, run, window_frames in completed:
-            metrics.extend(
-                save_window(
-                    series,
-                    origin,
-                    days,
-                    run,
-                    "final",
-                    root,
-                    client,
-                    protocol["experiment_sha256"],
-                    frames=window_frames,
-                )
-            )
-            frames.append(
-                pd.read_csv(
-                    output(root) / f"final/2026-09-01_run{run}_hourly.csv",
-                    parse_dates=["hour_start"],
-                ).set_index("hour_start")
-            )
-        base = output(root) / "final"
-        write_frame(
-            base / "metrics.csv",
-            pd.DataFrame(metrics).set_index(["origin", "candidate", "scope"]),
+        save_windows(root, series, completed, "final")
+        write_json(
+            output(root) / "final/repeatability.json",
+            repeatability([frames["hourly"] for _, _, _, frames in completed]),
         )
-        write_json(base / "repeatability.json", repeatability(frames))
-        write_json(base / "reliability.json", stage_reliability(root, "final"))
         manifest.update(
             complete=True,
-            files=hashes(root, [p for p in base.rglob("*") if p != path]),
+            files=hashes(root, [p for p in path.parent.rglob("*") if p != path]),
             **journal_snapshot(root),
         )
         write_json(path, manifest)
-        print(
-            "Saved all three frozen September runs; do not tune against these results."
-        )
+        print("Saved three exploratory September hybrid runs.")
 
 
 def export_october(hourly, path):
-    frame = hourly[["forecast", "p10", "p90"]].rename_axis("hour_start")
-    content = frame.to_csv(date_format="%Y-%m-%d %H:%M:%S", float_format="%.10f")
+    content = (
+        hourly[["forecast", "p10", "p90"]]
+        .rename_axis("hour_start")
+        .to_csv(date_format="%Y-%m-%d %H:%M:%S", float_format="%.10f")
+    )
     validate_hourly(pd.read_csv(io.StringIO(content)))
     if Path(path).exists():
-        raise ValueError("Refusing to overwrite an existing llm_forecast.csv")
+        raise ValueError("Refusing to overwrite an existing hybrid October submission")
     atomic_bytes(path, content.encode())
 
 
 def forecast(root=ROOT, client=None):
     root = Path(root)
     with exclusive(root):
-        protocol = frozen_protocol(root)
+        protocol = validate_protocol(root)
         final = read_json(output(root) / "final/manifest.json")
         verify_manifest(root, final)
         if not final.get("complete"):
-            raise ValueError(
-                "Complete all three September runs before October forecasting"
-            )
+            raise ValueError("Complete three hybrid September runs before October")
         path = output(root) / "forecast_manifest.json"
         if path.exists():
             verify_manifest(root, read_json(path))
-            print("Preserving validated October forecast; no LLM calls made.")
+            print("Preserving validated hybrid October forecast; no calls made.")
             return
-        if (root / "llm_forecast.csv").exists():
+        if (root / EXPORT_NAME).exists():
             raise ValueError(
-                "Existing llm_forecast.csv has no verified manifest; preserve and inspect it"
+                "Existing hybrid submission has no verified manifest; preserve it"
             )
         client = client or LLMClient()
         check_client(client, protocol)
         series = hourly_counts(load_studies(root / "data/studies.csv"))
-        hourly, daily, chunks = forecast_window(
+        completed = collect_windows(
             series,
-            "2026-10-01",
-            FORECAST_DAYS,
-            1,
+            [("2026-10-01", 31, 1)],
             "october",
             root,
             client,
             protocol["experiment_sha256"],
         )
-        write_frame(output(root) / "october_daily.csv", daily)
-        write_frame(output(root) / "october_chunks.csv", chunks)
-        write_json(
-            output(root) / "october_reliability.json",
-            stage_reliability(root, "october"),
-        )
-        export_october(hourly, root / "llm_forecast.csv")
-        paths = [
-            root / "llm_forecast.csv",
-            output(root) / "october_daily.csv",
-            output(root) / "october_chunks.csv",
-            output(root) / "october_reliability.json",
-        ]
+        save_windows(root, series, completed, "october")
+        export_october(completed[0][3]["hourly"], root / EXPORT_NAME)
+        paths = [root / EXPORT_NAME, *(output(root) / "october").rglob("*")]
         write_json(
             path,
             {
@@ -949,4 +876,4 @@ def forecast(root=ROOT, client=None):
                 **journal_snapshot(root),
             },
         )
-        print("Saved validated llm_forecast.csv with 744 October hours.")
+        print(f"Saved {EXPORT_NAME}: 744 October hours.")
